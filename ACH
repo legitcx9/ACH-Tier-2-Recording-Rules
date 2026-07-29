@@ -1,6 +1,6 @@
 <#
 =====================================================================================
- ACH Official T2 Recording Rules
+ ACH Official Recording Rules
  Author: LegitCX9
  GitHub: github.com/legitcx9
  Discord: discord.gg/arsenalhub
@@ -35,7 +35,7 @@ chcp 65001 > $null
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
 
-$host.UI.RawUI.WindowTitle = "ACH Official T2 Recording Rules"
+$host.UI.RawUI.WindowTitle = "ACH Official Recording Rules"
 
 # =====================================================================================
 # 0. Elevation guard
@@ -365,7 +365,7 @@ $ascii = @"
 |                                                                  |
 +----------------------------------------------------------------+
 
-     ACH Official T2 Recording Rules
+     ACH Official Recording Rules
      Author: LegitCX9
      GitHub: github.com/legitcx9
      Discord: discord.gg/arsenalhub
@@ -544,7 +544,7 @@ Write-ColoredLine "Complete all steps with 100% success to pass." White
 Write-ColoredLine "Applications will download and extract to C:\ToolsACH." White
 Write-ColoredLine "If a prompt shows up, press OK to run the application." White
 Write-ColoredLine "Follow the instructions listed on each step." White
-Write-ColoredLine "This ACH T2 PowerShell process currently has 6 steps, followed by an" White
+Write-ColoredLine "This PowerShell process currently has 6 steps, followed by an" White
 Write-ColoredLine "Automatic evidence-packaging pass at the end." White
 Write-ColoredLine "Make sure to scroll slowly in each and every window that pops up." White
 Write-Host ""
@@ -1745,7 +1745,7 @@ Clear-Host
 # =====================================================================================
 
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-$outputRoot = Join-Path $env:USERPROFILE "Desktop\ACH-T2-OUTPUT"
+$outputRoot = Join-Path $env:USERPROFILE "Desktop\ACH"
 $outputName = "OUTPUT-$timestamp"
 $outputPath = Join-Path $outputRoot $outputName
 $zipPath = "$outputPath.zip"
