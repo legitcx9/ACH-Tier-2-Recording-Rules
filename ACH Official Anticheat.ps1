@@ -4,7 +4,8 @@
  Author: LegitCX9
  Discord: discord.gg/arsenalhub
 
- This file merges the two previous scripts into one:
+ This script includes:-
+ 
    1) The interactive 6-step "recording rules" walkthrough the player follows
       on camera (module/signature audit, prefetch, BAM, autoruns, WinObj,
       Process Explorer).
@@ -12,7 +13,7 @@
       process/service/driver dumps, integrity manifest, zip) that used to be
       a separate script the player had to remember to also run.
 
- Fixes applied vs the originals (see the inline comments marked FIX: for detail):
+ Version 1.00 Fixes applied:-
    - Relaunches under 64-bit PowerShell so Get-MpComputerStatus / Get-MpPreference /
      Get-MpThreat stop throwing "Invalid class" MetadataErrors.
    - Actually enables Memory Integrity / VBS instead of only reporting it's off.
@@ -28,7 +29,7 @@
    - Replaces fragile SendKeys-based window maximizing with direct Win32 calls.
    - Adds a SHA-256 hash pin before importing the externally-hosted Process
      Explorer .reg file, so a compromised/edited paste can't silently push
-     arbitrary registry changes -- see the SECURITY NOTE near Step 6.
+     arbitrary registry changes see the SECURITY NOTE near Step 6.
 
 =====================================================================================
 #>
