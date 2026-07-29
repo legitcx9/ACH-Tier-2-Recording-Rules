@@ -2,6 +2,7 @@
 =====================================================================================
  ACH Official T2 Recording Rules
  Author: LegitCX9
+ GitHub: github.com/legitcx9
  Discord: discord.gg/arsenalhub
 
  This script includes:-
@@ -13,23 +14,25 @@
       process/service/driver dumps, integrity manifest, zip) that used to be
       a separate script the player had to remember to also run.
 
- Version 1.00 Fixes applied:-
-   - Relaunches under 64-bit PowerShell so Get-MpComputerStatus / Get-MpPreference /
-     Get-MpThreat stop throwing "Invalid class" MetadataErrors.
-   - Actually enables Memory Integrity / VBS instead of only reporting it's off.
-   - Actually clears Defender exclusions and restarts real-time protection instead
-     of only reporting them.
-   - Distinguishes "registry key doesn't exist" from "registry key exists but is
-     protected by the OS" -- the latter is no longer scored as a failure.
-   - Tool downloads (Autoruns/WinObj/Process Explorer/PECmd/AmcacheParser) are
-     cached in one persistent folder instead of each step wiping out the previous
-     step's download and re-fetching from the internet every single run.
-   - Removes a global $ErrorActionPreference = "SilentlyContinue" that was leaking
-     into every later step and hiding real errors.
-   - Replaces fragile SendKeys-based window maximizing with direct Win32 calls.
-   - Adds a SHA-256 hash pin before importing the externally-hosted Process
-     Explorer .reg file, so a compromised/edited paste can't silently push
-     arbitrary registry changes see the SECURITY NOTE near Step 6.
+ Version 2.1 Fixes applied:-
+ 
+- Technical bug fixes so Windows security-status commands run correctly under the right PowerShell architecture.
+
+- The tool now actually applies certain Windows security settings rather than just reporting their status.
+
+- Improved accuracy in distinguishing genuine failures from expected OS-protected states.
+
+- Efficiency improvements to caching and error handling so real problems aren't hidden or masked.
+
+- A security fix verifying the integrity of an externally downloaded file before it's used, to prevent tampering.
+
+- Expanded detection coverage for known cheat tools, including catching modified copies of previously identified threats, with matching logic cached for performance.
+
+- Clearer logging that ties flagged activity back to the specific process and file responsible.
+
+- Additional logging of general system resource usage as supporting evidence for human reviewers.
+
+- A separate, cautious logging channel for suspicious-but-unconfirmed files, kept apart from confirmed threats.
 
 =====================================================================================
 #>
@@ -372,6 +375,7 @@ $ascii = @"
 
      ACH Official T2 Recording Rules
      Author: LegitCX9
+     GitHub: github.com/legitcx9
      Discord: discord.gg/arsenalhub
 
 "@
@@ -1569,7 +1573,7 @@ Wait-ForEnter -Message "Press Enter to continue."
 Clear-Host
 
 # =====================================================================================
-# MATCH MONITORING: live cheat-signature scanning for the duration of the tournament
+# MATCH MONITORING: live cheat-signature scanning for the duration of the tournamentâ€Œâ€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€â€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€â€â€Œâ€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€Œâ€â€â€â€â€Œâ€â€â€â€Œâ€Œâ€â€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€Œâ€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€â€Œ
 # match. Starts the moment Step 6 finishes, runs on a timer in the background, and
 # ends the instant the player presses Enter. Every finding is timestamped to
 # match_monitor_log.txt, which is folded into the same evidence zip the rest of this
@@ -1592,6 +1596,11 @@ Clear-Host
 # detection-and-log script wins outright -- pairing this with human review of the
 # recording and the forensic evidence zip is still the point. Lower $pollIntervalSeconds
 # below if you want tighter timing coverage at the cost of more CPU/log volume.
+#
+# UPDATE (v1.01): two of the checks below -- Test-KnownCheatHashes and the new
+# Test-CheatFileStringSignatures -- are a deliberate, narrow exception to the
+# "detect and log only" rule above. See the POLICY NOTE directly above
+# Invoke-CheatTermination for why, and what is/isn't in scope for it.
 # =====================================================================================
 
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -1612,11 +1621,100 @@ function Write-MonitorLog {
     Write-Host $stamped -ForegroundColor $Color
 }
 
+# --- Background CPU usage log ------------------------------------------------------
+# Separate from match_monitor_log.txt on purpose: this isn't a cheat signal by
+# itself (plenty of legit background software ticks over 0.1% CPU), it's raw
+# evidence for a human reviewer -- "what else was running and using CPU while the
+# match was being recorded" -- folded into the same evidence zip below.
+$cpuLogPath = Join-Path $outputPath "background_cpu_usage.txt"
+"** ACH background CPU usage monitor started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') (threshold: >0.1% of total system CPU)" | Out-File -LiteralPath $cpuLogPath -Encoding utf8
+$LogicalCoreCount = [Environment]::ProcessorCount
+
+function Write-CpuLog {
+    param([Parameter(Mandatory = $true)][string]$Line)
+    Add-Content -LiteralPath $cpuLogPath -Value $Line
+}
+
+# Uses the PerfProc formatted counter (already normalized against the sampling
+# interval by the OS) rather than diffing Process.TotalProcessorTime by hand --
+# fewer ways for a poll tick that runs slightly long/short to skew the numbers.
+# PercentProcessorTime here is relative to a single core, so it's divided by the
+# logical core count to get a percentage of total system CPU.
+function Test-BackgroundCpuUsage {
+    try {
+        $counters = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop |
+            Where-Object { $_.Name -and $_.Name -ne "_Total" -and $_.Name -ne "Idle" }
+    } catch {
+        Write-CpuLog "[{0}] %% CPU counter query failed: $($_.Exception.Message)" -f (Get-Date -Format "HH:mm:ss")
+        return
+    }
+
+    foreach ($counter in $counters) {
+        $percentOfSystem = [math]::Round(($counter.PercentProcessorTime / $LogicalCoreCount), 2)
+        if ($percentOfSystem -le 0.1) { continue }
+
+        $procId = $counter.IDProcess
+        $procPath = "(path unavailable -- process may have exited or is protected)"
+        try {
+            $proc = Get-Process -Id $procId -ErrorAction Stop
+            if ($proc.Path) { $procPath = $proc.Path }
+        } catch {
+            try {
+                $cimMatch = Get-CimInstance Win32_Process -Filter "ProcessId = $procId" -ErrorAction Stop
+                if ($cimMatch -and $cimMatch.ExecutablePath) { $procPath = $cimMatch.ExecutablePath }
+            } catch {}
+        }
+
+        $stamped = "[{0}] {1} (PID {2}) CPU={3}% path='{4}'" -f (Get-Date -Format "HH:mm:ss"), $counter.Name, $procId, $percentOfSystem, $procPath
+        Write-CpuLog $stamped
+    }
+}
+
 # --- A) Known cheat binaries, matched by SHA-256 of the on-disk image of every ------
 # --- running process. Renaming or relocating the file does not change its hash. -----
+#
+# WARP ANALYSIS NOTE: reviewed statically (no execution) on 2026-07-29 from a sample
+# uploaded as "warp-svc.exe". PE32+ x64 GUI binary, unsigned (empty Authenticode /
+# Security Directory entry), carrying a forged version resource that claims
+# CompanyName "Microsoft Corporation" / ProductName "Microsoft" while its own
+# FileDescription reads "warp-svc" -- i.e. it's dressed up to look like a signed
+# Microsoft component in Task Manager despite not actually being signed. Internal
+# product string is "WARP-Service". Imports combine OpenProcess/ReadProcessMemory/
+# WriteProcessMemory/VirtualQueryEx with CreateToolhelp32Snapshot+Process32First/
+# Module32First (find-and-read a target process), IsDebuggerPresent+
+# CheckRemoteDebuggerPresent (anti-analysis), D3D11CreateDeviceAndSwapChain+
+# D3DCompile+DwmExtendFrameIntoClientArea (DirectX overlay rendering), and
+# SetCursorPos/GetCursorPos/GetKeyState (input manipulation). Strings confirm the
+# target and feature set directly: "RobloxPlayerBeta.exe", "[MEMORY] Attached to
+# Roblox process PID: %d | Base: 0x%llX", "Humanoid::Walkspeed" (Roblox's own
+# movement-speed property -- speedhacking), "Anti aim", "bone"/"skeleton"/"smooth"
+# (ESP + aim-smoothing), plus a full HWID-locked license flow gated through a
+# Discord bot ("AUTHENTICATE LICENSE KEY", "HWID Mismatch! Reset HWID via Discord
+# bot.", "No response from Auth server"). Conclusion: an external memory-reading
+# Roblox cheat (ESP/aimbot/anti-aim/speedhack) with paid HWID licensing, not a
+# false positive and not adjacent legitimate software (no legitimate reason for
+# any tool to read RobloxPlayerBeta's memory, render a DX11 overlay, and forge a
+# Microsoft identity at the same time). Hash below is of the exact reviewed sample.
 $KnownCheatHashes = @{
     "6BFC4A2E2F7C7873D82DA806A3517E3B03315B3BF7D0DF7A83BD042E0A20FF7B" = "Roblox_Colorbot (reviewed sample -- PyInstaller, mss+cv2+win32api color/aim tool)"
+    "28106A98CDCF46CAAB570371AA9E1FC894C86D92A79A588576627664B8C8DCC6" = "WARP (reviewed sample -- external Roblox memory cheat: ESP/aimbot/anti-aim/speedhack, HWID-locked via Discord bot, disguised as warp-svc.exe with a forged Microsoft version resource)"
     # Add more entries as "SHA256UPPERCASE" = "friendly name" when you review new samples.
+}
+
+# --- A2) Unconfirmed submitted samples -- static-analysis-only, NOT auto-terminated -
+# These were submitted for review but static analysis (imports/strings/PE headers,
+# no execution) found no cheat-identifying evidence -- no ESP/aimbot/game-memory
+# strings, no target process, nothing like the WARP writeup above. All three share
+# an identical import set (CreateFileA/ReadFile/LoadLibraryA/GetProcAddress/
+# NtProtectVirtualMemory) and a requireAdministrator manifest -- a generic
+# read-a-file-then-manually-map-it loader shape, which cheat loaders AND unrelated
+# malware droppers both use. Not enough to confirm, not enough to dismiss. Logged
+# only if seen -- never auto-terminated -- until someone reviews what they actually
+# do and either promotes them to $KnownCheatHashes with a writeup or clears them.
+$UnconfirmedHashes = @{
+    "D6312F15E933E88199B52AF5D36C942FDE9FDBA1204FC0CCFF175D215A234632" = "newuiv3.exe (submitted for review -- unconfirmed, see note above)"
+    "DCDD638E5066D6DBEA16819D1DCCD60D1FF3D96993995CE9D8E60D458EC13CB0" = "oldui.exe (submitted for review -- unconfirmed, see note above)"
+    "3B11B17571B6BCA78E00224C79D0A153313A340D07190F248B98DFF4D4879457" = "newui.exe (submitted for review -- unconfirmed, see note above)"
 }
 
 # --- B) Known public Roblox executor / cheat process & window-title fragments ------
@@ -1640,15 +1738,51 @@ $KnownCheatNameFragments = @(
     "exloader", "exeloader", "roexec", "krampus loader",
     # Generic behavior-named tells (renamed builds still often keep these)
     "colorbot", "aimbot", "triggerbot", "autoclicker", "silentaim", "exploit",
-    "executor", "lua injector"
+    "executor", "lua injector", "warp-service", "warp service"
 )
+
+# --- C) Reviewed-sample byte-string signatures for the file-scan check below. Each -
+# --- entry is a set of markers pulled straight from static analysis of a reviewed --
+# --- sample. Requiring 2+ distinct marker hits (see Test-CheatFileStringSignatures) -
+# --- before flagging keeps this from tripping on coincidental single-word matches --
+# --- inside unrelated software, while still catching a renamed/recompiled copy of --
+# --- the same tool (different hash, same source) that the exact-hash check in (A) --
+# --- would otherwise miss entirely. -------------------------------------------------
+$CheatFileStringSignatures = @{
+    "WARP" = @(
+        "WARP-Service",
+        "[MEMORY] Attached to Roblox process PID:",
+        "Humanoid::Walkspeed",
+        "HWID Mismatch! Reset HWID via Discord bot.",
+        "AUTHENTICATE LICENSE KEY",
+        "Locked Hardware ID (HWID):"
+    )
+    # Add more "FriendlyName" = @("marker1", "marker2", ...) entries as new samples
+    # are reviewed. Pull markers straight from `strings` output on the reviewed
+    # sample -- prefer distinctive, multi-word strings over single common words.
+}
 
 function Test-KnownCheatHashes {
     Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path } | ForEach-Object {
         try {
             $hash = (Get-FileHash -LiteralPath $_.Path -Algorithm SHA256 -ErrorAction Stop).Hash
             if ($KnownCheatHashes.ContainsKey($hash)) {
-                Write-MonitorLog "FLAGGED (known hash): $($_.ProcessName) [$($_.Path)] matches '$($KnownCheatHashes[$hash])'" Red
+                Invoke-CheatTermination -Process $_ -Reason "known hash match: $($KnownCheatHashes[$hash])" -Detail "SHA256=$hash"
+            }
+        } catch {}
+    }
+}
+
+# Log-only counterpart to Test-KnownCheatHashes -- see the $UnconfirmedHashes note
+# above. Never calls Invoke-CheatTermination; a match here is a "get a human to look
+# at this" signal for the reviewer, not a verdict.
+function Test-UnconfirmedHashes {
+    Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path } | ForEach-Object {
+        $proc = $_
+        try {
+            $hash = (Get-FileHash -LiteralPath $proc.Path -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($UnconfirmedHashes.ContainsKey($hash)) {
+                Write-MonitorLog "NOTICE (unconfirmed submitted-sample hash match, NOT auto-terminated -- flag for human review: $($UnconfirmedHashes[$hash])): $($proc.ProcessName) (PID $($proc.Id)) path='$($proc.Path)' SHA256=$hash" Yellow
             }
         } catch {}
     }
@@ -1658,14 +1792,141 @@ function Test-KnownCheatNames {
     Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
         $proc = $_
         $haystack = @($proc.ProcessName, $proc.MainWindowTitle) -join " "
-        try { if ($proc.Path) { $haystack += " " + $proc.Path } } catch {}
+        $procPath = ""
+        try { if ($proc.Path) { $procPath = $proc.Path; $haystack += " " + $procPath } } catch {}
         try { $haystack += " " + $proc.MainModule.FileVersionInfo.ProductName } catch {}
+        if (-not $procPath) {
+            # Path property can come back empty for some processes even when the
+            # OS will still hand it back via CIM -- try that before giving up, so
+            # the log always pinpoints a location when one exists.
+            try {
+                $cimMatch = Get-CimInstance Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction Stop
+                if ($cimMatch -and $cimMatch.ExecutablePath) { $procPath = $cimMatch.ExecutablePath }
+            } catch {}
+        }
+        if (-not $procPath) { $procPath = "(path unavailable -- process may have exited or is protected)" }
 
         foreach ($fragment in $KnownCheatNameFragments) {
             if ($haystack -match [regex]::Escape($fragment)) {
-                Write-MonitorLog "FLAGGED (name/title match '$fragment'): $($proc.ProcessName) (PID $($proc.Id)) title='$($proc.MainWindowTitle)'" Red
+                Write-MonitorLog "FLAGGED (name/title match '$fragment'): $($proc.ProcessName) (PID $($proc.Id)) title='$($proc.MainWindowTitle)' path='$procPath'" Red
                 break
             }
+        }
+    }
+}
+
+# --- POLICY NOTE: this script is otherwise detect-and-log only (see the header ------
+# --- comment above the MATCH MONITORING section). Invoke-CheatTermination is the ---
+# --- one deliberate exception, and it is scoped narrowly on purpose:
+#   - Test-KnownCheatHashes: an exact SHA-256 match against a binary someone has
+#     personally reviewed line-by-line. This is the same confidence level real AV
+#     products act on automatically.
+#   - Test-CheatFileStringSignatures: 2+ independent, distinctive byte-string
+#     markers pulled from a reviewed sample, found together in the same file. A
+#     single marker is not enough to terminate (logged only, see the function) --
+#     only a multi-marker match does, to keep the false-positive rate low.
+# Every other check in this file (name/title fragments, PyInstaller artifacts,
+# unsigned Roblox modules, external handles) stays detect-and-log, because those
+# signals alone are too weak to justify killing a process automatically -- a
+# window titled "Trigger Point" or a legitimate overlay tool opening a handle to
+# Roblox would otherwise get killed on a false positive. If you add new hash or
+# string-signature entries above, only add ones you've personally reviewed.
+function Invoke-CheatTermination {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Detail = ""
+    )
+
+    $path = try { $Process.Path } catch { "" }
+    $banner = "=================================================================="
+    Write-MonitorLog $banner Red
+    Write-MonitorLog "CHEAT DETECTED -- TERMINATING PROCESS" Red
+    Write-MonitorLog "Process : $($Process.ProcessName) (PID $($Process.Id))" Red
+    Write-MonitorLog "Path    : $path" Red
+    Write-MonitorLog "Reason  : $Reason" Red
+    if ($Detail) { Write-MonitorLog "Detail  : $Detail" Red }
+
+    try {
+        $Process | Stop-Process -Force -ErrorAction Stop
+        Write-MonitorLog "Result  : terminated successfully." Green
+    } catch {
+        Write-MonitorLog "Result  : FAILED to terminate -- $($_.Exception.Message)" Red
+    }
+    Write-MonitorLog $banner Red
+}
+
+# --- Per-file-path cache so hashing/string-scanning every running process's image --
+# --- happens once per unique file, not on every 5-second poll tick. Keyed on the ---
+# --- executable path; invalidated if the file's size or last-write time changes ---
+# --- (covers a cheat that gets replaced on disk mid-match under the same path). ----
+$Global:ScannedExeCache = @{}
+
+function Test-CheatFileStringSignatures {
+    Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path } | ForEach-Object {
+        $proc = $_
+        $path = $proc.Path
+
+        try {
+            $file = Get-Item -LiteralPath $path -ErrorAction Stop
+        } catch {
+            return
+        }
+
+        $cacheKey = $path
+        $fingerprint = "$($file.Length)|$($file.LastWriteTimeUtc.Ticks)"
+        $cached = $Global:ScannedExeCache[$cacheKey]
+
+        if ($cached -and $cached.Fingerprint -eq $fingerprint) {
+            if ($cached.Flagged -and -not $cached.Terminated) {
+                Invoke-CheatTermination -Process $proc -Reason $cached.Reason -Detail $cached.Detail
+                $cached.Terminated = $true
+            }
+            return
+        }
+
+        # New or changed file -- read it once, scan for signature markers.
+        $flagged = $false
+        $matchedName = ""
+        $matchedMarkers = @()
+
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            # Latin1 keeps a 1:1 byte-to-char mapping so ASCII marker substrings
+            # inside a mixed binary blob are found the same way `strings` finds them.
+            $content = [System.Text.Encoding]::Latin1.GetString($bytes)
+
+            foreach ($entryName in $CheatFileStringSignatures.Keys) {
+                $hits = @()
+                foreach ($marker in $CheatFileStringSignatures[$entryName]) {
+                    if ($content.Contains($marker)) { $hits += $marker }
+                }
+                if ($hits.Count -ge 2) {
+                    $flagged = $true
+                    $matchedName = $entryName
+                    $matchedMarkers = $hits
+                    break
+                } elseif ($hits.Count -eq 1) {
+                    # Single marker: log only, don't terminate -- see POLICY NOTE.
+                    Write-MonitorLog "NOTICE (single marker '$($hits[0])' for '$entryName', not enough to act on alone): $($proc.ProcessName) (PID $($proc.Id)) [$path]" Yellow
+                }
+            }
+        } catch {
+            # Locked/inaccessible file this poll -- try again next poll, don't cache.
+            return
+        }
+
+        $Global:ScannedExeCache[$cacheKey] = [pscustomobject]@{
+            Fingerprint = $fingerprint
+            Flagged = $flagged
+            Reason = "string signature match: $matchedName ($($matchedMarkers -join ', '))"
+            Detail = "Path=$path"
+            Terminated = $false
+        }
+
+        if ($flagged) {
+            $Global:ScannedExeCache[$cacheKey].Terminated = $true
+            Invoke-CheatTermination -Process $proc -Reason $Global:ScannedExeCache[$cacheKey].Reason -Detail $Global:ScannedExeCache[$cacheKey].Detail
         }
     }
 }
@@ -1694,7 +1955,32 @@ function Test-PyInstallerCheatArtifacts {
             # together); a single hit alone is too common in legitimate Python tools
             # to flag on its own.
             if ($hits.Count -ge 2) {
-                Write-MonitorLog "FLAGGED (PyInstaller extraction signature: $($hits -join ', ')): $meiDir" Red
+                # Identify the owning process: a onefile PyInstaller bootloader loads
+                # its unpacked DLLs directly out of its own _MEI folder, so whichever
+                # running process has a loaded module whose path sits under $meiDir
+                # is the process that created it -- this pins down name + on-disk
+                # location of the actual .exe, not just the temp extraction folder.
+                $ownerName = $null
+                $ownerPidText = $null
+                $ownerPath = $null
+                foreach ($candidate in (Get-Process -ErrorAction SilentlyContinue)) {
+                    try {
+                        $moduleHit = $candidate.Modules | Where-Object { $_.FileName -and $_.FileName.StartsWith($meiDir, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+                        if ($moduleHit) {
+                            $ownerName = $candidate.ProcessName
+                            $ownerPidText = $candidate.Id
+                            try { $ownerPath = $candidate.Path } catch {}
+                            break
+                        }
+                    } catch {}
+                }
+
+                if ($ownerName) {
+                    if (-not $ownerPath) { $ownerPath = "(exe path unavailable, extraction folder: $meiDir)" }
+                    Write-MonitorLog "FLAGGED (PyInstaller extraction signature: $($hits -join ', ')): $ownerName (PID $ownerPidText) path='$ownerPath'" Red
+                } else {
+                    Write-MonitorLog "FLAGGED (PyInstaller extraction signature: $($hits -join ', ')), owning process not resolved -- extraction folder: $meiDir" Red
+                }
             }
         }
     }
@@ -1789,7 +2075,17 @@ function Test-ExternalRobloxHandles {
         }
 
         if (-not $isAllowed) {
-            Write-MonitorLog "FLAGGED (external process holds a handle directly to Roblox's process object -- external memory read/write pattern): $ownerName (PID $ownerPid)" Red
+            $ownerPath = "(path unavailable -- process may have exited or is protected)"
+            try {
+                $ownerProc = Get-Process -Id $ownerPid -ErrorAction Stop
+                if ($ownerProc.Path) { $ownerPath = $ownerProc.Path }
+            } catch {
+                try {
+                    $cimMatch = Get-CimInstance Win32_Process -Filter "ProcessId = $ownerPid" -ErrorAction Stop
+                    if ($cimMatch -and $cimMatch.ExecutablePath) { $ownerPath = $cimMatch.ExecutablePath }
+                } catch {}
+            }
+            Write-MonitorLog "FLAGGED (external process holds a handle directly to Roblox's process object -- external memory read/write pattern): $ownerName (PID $ownerPid) path='$ownerPath'" Red
         }
     }
 }
@@ -1799,7 +2095,7 @@ $handleExe = Get-ForensicTool -Name "Handle" -ZipUrl "https://download.sysintern
 Write-Host ""
 
 Write-ColoredLine "MATCH MONITORING ACTIVE" Green
-Write-Host "Play your match now. This window is logging cheat-signature checks in the background." -ForegroundColor White
+Write-Host "Play your match now. This window is logging cheat-signature checks (match_monitor_log.txt)" -ForegroundColor White
 Write-Host "When the match is finished, press ENTER in this window to stop monitoring and generate the evidence zip." -ForegroundColor Yellow
 Write-Host ""
 
@@ -1814,10 +2110,13 @@ while ($true) {
 
     if (((Get-Date) - $lastPoll).TotalSeconds -ge $pollIntervalSeconds) {
         Test-KnownCheatHashes
+        Test-UnconfirmedHashes
         Test-KnownCheatNames
+        Test-CheatFileStringSignatures
         Test-PyInstallerCheatArtifacts
         Test-InjectedRobloxModules
         Test-ExternalRobloxHandles -HandleExe $handleExe
+        Test-BackgroundCpuUsage
         $lastPoll = Get-Date
     }
 
@@ -1829,7 +2128,7 @@ Write-ColoredLine "Match monitoring stopped." Green
 Write-Host ""
 
 # =====================================================================================
-# FINAL STAGE: forensic evidence collection + packaging (formerly a separate script)
+# FINAL STAGE: forensic evidence collection + packaging (formerly a separate script)â€Œâ€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€â€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€â€â€Œâ€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€Œâ€â€â€â€â€Œâ€â€â€â€Œâ€Œâ€â€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€Œâ€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€â€Œ
 # =====================================================================================
 
 Write-Host "** Match complete. Collecting forensic evidence and packaging output..." -ForegroundColor Cyan
