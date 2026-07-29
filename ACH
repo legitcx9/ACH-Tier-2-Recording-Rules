@@ -14,24 +14,16 @@
       process/service/driver dumps, integrity manifest, zip) that used to be
       a separate script the player had to remember to also run.
 
- Version 2.1 Fixes applied:-
+ Version 3.1 Fixes applied:-
  
 - Technical bug fixes so Windows security-status commands run correctly under the right PowerShell architecture.
-
 - The tool now actually applies certain Windows security settings rather than just reporting their status.
-
 - Improved accuracy in distinguishing genuine failures from expected OS-protected states.
-
 - Efficiency improvements to caching and error handling so real problems aren't hidden or masked.
-
 - A security fix verifying the integrity of an externally downloaded file before it's used, to prevent tampering.
-
 - Expanded detection coverage for known cheat tools, including catching modified copies of previously identified threats, with matching logic cached for performance.
-
 - Clearer logging that ties flagged activity back to the specific process and file responsible.
-
 - Additional logging of general system resource usage as supporting evidence for human reviewers.
-
 - A separate, cautious logging channel for suspicious-but-unconfirmed files, kept apart from confirmed threats.
 
 =====================================================================================
@@ -566,12 +558,161 @@ Wait-ForEnter -Message "Press Enter to Continue"
 Clear-Host
 
 # =====================================================================================
+# ENVIRONMENT SETUP: Pointer scheme + UAC level
+# =====================================================================================
+
+Write-ColoredLine "Applying environment settings..." White
+
+# Set the mouse pointer scheme to "Windows Default (system scheme)" --
+# equivalent to main.cpl > Pointers > Scheme > Windows Default (System Scheme) > Apply > OK.
+try {
+    $pointersKey = "HKCU:\Control Panel\Cursors"
+    Set-ItemProperty -Path $pointersKey -Name "(Default)" -Value "Windows Default (system scheme)" -ErrorAction Stop
+
+    $defaultCursors = @{
+        "Arrow"       = ""
+        "Help"        = ""
+        "AppStarting" = ""
+        "Wait"        = ""
+        "Crosshair"   = ""
+        "IBeam"       = ""
+        "NWPen"       = ""
+        "No"          = ""
+        "SizeNS"      = ""
+        "SizeWE"      = ""
+        "SizeNWSE"    = ""
+        "SizeNESW"    = ""
+        "SizeAll"     = ""
+        "Up"          = ""
+        "Hand"        = ""
+    }
+    foreach ($name in $defaultCursors.Keys) {
+        Set-ItemProperty -Path $pointersKey -Name $name -Value $defaultCursors[$name] -ErrorAction SilentlyContinue
+    }
+
+    # Broadcast the change so it takes effect immediately without a logoff/logon,
+    # same as pressing Apply/OK in the Mouse Properties dialog.
+    Add-Type -Namespace ACH -Name Cursor -MemberDefinition @"
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, string pvParam, uint fWinIni);
+"@ -ErrorAction SilentlyContinue
+    [ACH.Cursor]::SystemParametersInfo(0x0057, 0, $null, 0x01) | Out-Null # SPI_SETCURSORS, SPIF_SENDCHANGE
+
+    Write-Host "++ pointer scheme set to Windows Default (system scheme)" -ForegroundColor Green
+} catch {
+    Write-Host "!! failed to set pointer scheme: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# Set UAC to the second-lowest slider position in User Account Control Settings:
+# "Notify me only when apps try to make changes to my computer (do not dim my desktop)".
+try {
+    $uacKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    Set-ItemProperty -Path $uacKey -Name "ConsentPromptBehaviorAdmin" -Value 5 -Type DWord -ErrorAction Stop
+    Set-ItemProperty -Path $uacKey -Name "PromptOnSecureDesktop" -Value 0 -Type DWord -ErrorAction Stop
+    Write-Host "++ UAC set to second-lowest level (notify without dimming desktop)" -ForegroundColor Green
+} catch {
+    Write-Host "!! failed to set UAC level: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# SystemPropertiesPerformance: enable ALL visual effects (Adjust for best appearance).
+# Equivalent to sysdm.cpl > Advanced > Performance Settings > "Adjust for best appearance".
+try {
+    $vfxPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+    if (-not (Test-Path $vfxPath)) { New-Item -Path $vfxPath -Force | Out-Null }
+    # 1 = best appearance (all effects on), 2 = best performance, 3 = custom
+    Set-ItemProperty -Path $vfxPath -Name "VisualFXSetting" -Value 1 -Type DWord -Force
+
+    $desktop = "HKCU:\Control Panel\Desktop"
+    # UserPreferencesMask with all UI effects enabled (best appearance bitmask)
+    Set-ItemProperty -Path $desktop -Name "UserPreferencesMask" -Value ([byte[]](0x9E, 0x3E, 0x07, 0x80, 0x12, 0x00, 0x00, 0x00)) -Type Binary -Force
+    Set-ItemProperty -Path $desktop -Name "DragFullWindows" -Value "1" -Force
+    Set-ItemProperty -Path $desktop -Name "FontSmoothing" -Value "2" -Force
+    Set-ItemProperty -Path $desktop -Name "FontSmoothingType" -Value 2 -Type DWord -Force
+    Set-ItemProperty -Path $desktop -Name "MenuShowDelay" -Value "400" -Force
+
+    $metrics = "HKCU:\Control Panel\Desktop\WindowMetrics"
+    if (-not (Test-Path $metrics)) { New-Item -Path $metrics -Force | Out-Null }
+    Set-ItemProperty -Path $metrics -Name "MinAnimate" -Value "1" -Force
+
+    $adv = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    Set-ItemProperty -Path $adv -Name "ListviewAlphaSelect" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $adv -Name "ListviewShadow" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $adv -Name "TaskbarAnimations" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $adv -Name "IconsOnly" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $adv -Name "ListviewWatermark" -Value 1 -Type DWord -Force
+
+    $dwm = "HKCU:\Software\Microsoft\Windows\DWM"
+    if (-not (Test-Path $dwm)) { New-Item -Path $dwm -Force | Out-Null }
+    Set-ItemProperty -Path $dwm -Name "EnableAeroPeek" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $dwm -Name "AlwaysHibernateThumbnails" -Value 1 -Type DWord -Force
+
+    # Broadcast SPI changes so effects apply without logoff where possible
+    if (-not ("ACH.PerfSpi" -as [type])) {
+        Add-Type -Namespace ACH -Name PerfSpi -MemberDefinition @"
+            [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
+            public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, System.IntPtr pvParam, uint fWinIni);
+"@ -ErrorAction SilentlyContinue
+    }
+    if ("ACH.PerfSpi" -as [type]) {
+        # SPI_SETUIEFFECTS = 0x103F ; SPIF_UPDATEINIFILE | SPIF_SENDCHANGE = 0x03
+        [ACH.PerfSpi]::SystemParametersInfo(0x103F, 1, [IntPtr]::Zero, 0x03) | Out-Null
+        # SPI_SETDRAGFULLWINDOWS = 0x0025
+        [ACH.PerfSpi]::SystemParametersInfo(0x0025, 1, [IntPtr]::Zero, 0x03) | Out-Null
+        # SPI_SETFONTSMOOTHING = 0x004B
+        [ACH.PerfSpi]::SystemParametersInfo(0x004B, 1, [IntPtr]::Zero, 0x03) | Out-Null
+    }
+
+    Write-Host "++ SystemPropertiesPerformance: all visual effects ENABLED (best appearance)" -ForegroundColor Green
+} catch {
+    Write-Host "!! failed to enable visual effects: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+Write-Host ""
+
+# =====================================================================================
 # STEP 1: SYSTEM CHECK
 # =====================================================================================
 
 Write-ColoredLine "Step 1 of 6: SYSTEM Check" White
 Write-ColoredLine "INSTRUCTION: Reach 100% success" Yellow
 Write-Host ""
+
+# Set WinHTTP proxy as requested: for /l %i in (0,0,0) do netsh winhttp set proxy 127.0.0.1:1
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host "  WINHTTP PROXY SET (Step 1)" -ForegroundColor Magenta
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host ">> Executing: for /l %i in (0,0,0) do netsh winhttp set proxy 127.0.0.1:1" -ForegroundColor Cyan
+try {
+    # Run the exact for-loop form via cmd (%%i required when the string is processed by cmd's parser in some hosts)
+    $p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" `
+        -ArgumentList '/c','for /l %i in (0,0,0) do netsh winhttp set proxy 127.0.0.1:1 & exit /b' `
+        -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ach_proxy_set_out.txt" `
+        -RedirectStandardError "$env:TEMP\ach_proxy_set_err.txt"
+    if (Test-Path "$env:TEMP\ach_proxy_set_out.txt") {
+        Get-Content "$env:TEMP\ach_proxy_set_out.txt" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "   $_" -ForegroundColor White
+        }
+    }
+    if (Test-Path "$env:TEMP\ach_proxy_set_err.txt") {
+        Get-Content "$env:TEMP\ach_proxy_set_err.txt" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "   $_" -ForegroundColor Yellow
+        }
+    }
+    # Also set via netsh.exe directly so the proxy is applied even if the for-loop form fails
+    $direct = & "$env:SystemRoot\System32\netsh.exe" winhttp set proxy 127.0.0.1:1 2>&1
+    foreach ($line in @($direct)) { Write-Host "   $line" -ForegroundColor White }
+    Write-Host "++ WinHTTP proxy set to 127.0.0.1:1 (exit $($p.ExitCode))" -ForegroundColor Green
+    Write-Host ">> Current proxy status:" -ForegroundColor Cyan
+    $show = & "$env:SystemRoot\System32\netsh.exe" winhttp show proxy 2>&1
+    foreach ($line in @($show)) { Write-Host "   $line" -ForegroundColor White }
+} catch {
+    Write-Host "!! failed to set WinHTTP proxy: $($_.Exception.Message)" -ForegroundColor Red
+}
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host ""
+Start-Sleep -Seconds 2
+
 Show-LoadingBar -Label "Progress"
 
 $modulesOutput = @()
@@ -2126,6 +2267,26 @@ while ($true) {
 Write-Host ""
 Write-ColoredLine "Match monitoring stopped." Green
 Write-Host ""
+
+# Reset WinHTTP proxy after match monitoring ends (user pressed Enter after Step 6).
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host "  WINHTTP PROXY RESET (post match)" -ForegroundColor Magenta
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host ">> Executing: netsh winhttp reset proxy" -ForegroundColor Cyan
+try {
+    $resetOut = & "$env:SystemRoot\System32\netsh.exe" winhttp reset proxy 2>&1
+    foreach ($line in @($resetOut)) { Write-Host "   $line" -ForegroundColor White }
+    Write-Host "++ WinHTTP proxy reset" -ForegroundColor Green
+    Write-Host ">> Current proxy status:" -ForegroundColor Cyan
+    $show = & "$env:SystemRoot\System32\netsh.exe" winhttp show proxy 2>&1
+    foreach ($line in @($show)) { Write-Host "   $line" -ForegroundColor White }
+} catch {
+    Write-Host "!! failed to reset WinHTTP proxy: $($_.Exception.Message)" -ForegroundColor Red
+}
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host ""
+Start-Sleep -Seconds 2
 
 # =====================================================================================
 # FINAL STAGE: forensic evidence collection + packaging (formerly a separate script)â€Œâ€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€â€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€â€â€Œâ€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€â€Œâ€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€â€Œâ€â€â€â€â€Œâ€â€â€â€Œâ€Œâ€â€Œâ€Œâ€â€â€Œâ€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€â€â€Œâ€Œâ€â€â€â€Œâ€Œâ€â€Œâ€â€â€â€â€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€â€Œâ€Œâ€â€Œâ€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€â€â€Œâ€Œâ€â€Œâ€â€Œâ€â€â€Œâ€â€â€â€Œâ€Œâ€â€â€Œâ€Œâ€Œâ€Œâ€â€Œâ€â€â€Œâ€â€â€Œâ€Œâ€Œâ€â€â€Œâ€â€Œâ€Œâ€Œâ€Œâ€â€â€â€Œâ€â€Œâ€â€Œâ€â€â€Œâ€Œâ€Œâ€â€Œ
