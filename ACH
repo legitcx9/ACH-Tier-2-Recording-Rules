@@ -14,17 +14,22 @@
       process/service/driver dumps, integrity manifest, zip) that used to be
       a separate script the player had to remember to also run.
 
- Version 5.1 changes (integrated):
- - Aggressively clear Defender exclusions from preferences and common registry locations.
- - Best-effort enablement attempts for a set of system mitigations (DEP, HVCI/Memory Integrity,
-   and System Process Mitigations where the OS exposes them).
- - Backup & clear shell:startup locations (current user + all users) before removing entries.
- - Set key security services to Automatic startup and attempt to start them.
- - Added step-1 reporting for additional mitigations (DEP, CFG, Kernel-mode hardware stack protection,
-   ControlFlowGuard, DataExecutionPrevention, BottomUpASLR, HighEntropyASLR, ValidateExceptionChains,
-   ValidateHeapIntegrity, ArbitraryCodeGuard, BlockLowIntegrityImages, BlockRemoteImages, DisableWin32kSystemCalls).
- - Kept console output quiet for heavy operations and logged full detail to session_monitor.log.
- - Added visible watermark lines and invisible watermark characters for ownership tracking.
+ Version 4.1 Fixes applied:-
+
+- Can now detect triggerbot, esp, extended hitboxes and external cheats.
+- Technical bug fixes so Windows security-status commands run correctly under the right PowerShell architecture.
+- The tool now actually applies certain Windows security settings rather than just reporting their status.
+- Improved accuracy in distinguishing genuine failures from expected OS-protected states.
+- Efficiency improvements to caching and error handling so real problems aren't hidden or masked.
+- A security fix verifying the integrity of an externally downloaded file before it's used, to prevent tampering.
+- Expanded detection coverage for known cheat tools, including catching modified copies of previously identified threats, with matching logic cached for performance.
+- Clearer logging that ties flagged activity back to the specific process and file responsible.
+- Additional logging of general system resource usage as supporting evidence for human reviewers.
+- A separate, cautious logging channel for suspicious-but-unconfirmed files, kept apart from confirmed threats.
+- Runs the on-camera verification steps (signature/module audit, prefetch,
+- BAM, autoruns, WinObj, Process Explorer), then keeps an eye on the machine
+- for known cheat signatures while the match is being played, and finally
+- Bundles everything up into a zip for review.
 
 =====================================================================================
 #>
@@ -35,12 +40,6 @@ chcp 65001 > $null
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
 $host.UI.RawUI.WindowTitle = "ACH Recording Rules"
-
-# Visible watermark
-# LegitCX9 | discord.gg/arsenalhub
-# Invisible watermark: (zero-width characters follow)
-# ﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿‌‍﻿
-# End of invisible watermark
 
 # ---------------------------------------------------------------------------
 # Elevation guard
@@ -564,225 +563,6 @@ try {
 
 Write-Host ""
 
-# -------------------------
-# New: Enable and report on system mitigations (best-effort)
-# -------------------------
-function Try-Enable-ProcessMitigations {
-    # Try to import a module that might expose Set-ProcessMitigation / Get-ProcessMitigation
-    try {
-        Import-Module ProcessMitigations -ErrorAction SilentlyContinue
-    } catch {}
-    $result = @{
-        Tried = $false
-        Enabled = @()
-        Failed = @()
-        Warnings = @()
-    }
-
-    # Helper wrapper for Get-ProcessMitigation -System
-    function Get-ProcessMitigationSafe {
-        try {
-            $pm = Get-ProcessMitigation -System -ErrorAction Stop
-            return $pm
-        } catch {
-            return $null
-        }
-    }
-
-    $pm = Get-ProcessMitigationSafe
-    if ($pm) {
-        $result.Tried = $true
-        # Attempt to enable a set of mitigations if Set-ProcessMitigation exists
-        if (Get-Command -Name Set-ProcessMitigation -ErrorAction SilentlyContinue) {
-            try {
-                # Example best-effort calls; syntax may vary by module version. Err on side of safety.
-                Set-ProcessMitigation -System -Enable DEP -ErrorAction SilentlyContinue
-                Set-ProcessMitigation -System -Enable SEHOP -ErrorAction SilentlyContinue
-                Set-ProcessMitigation -System -Enable CFG -ErrorAction SilentlyContinue
-                Set-ProcessMitigation -System -Enable BottomUpASLR -ErrorAction SilentlyContinue
-                Set-ProcessMitigation -System -Enable HighEntropyASLR -ErrorAction SilentlyContinue
-                Set-ProcessMitigation -System -Enable StrictMode -ErrorAction SilentlyContinue
-                $result.Enabled += "ProcessMitigations - system flags attempted"
-            } catch {
-                $result.Failed += "Set-ProcessMitigation calls failed: $($_.Exception.Message)"
-            }
-        } else {
-            $result.Warnings += "Set-ProcessMitigation not present on this system; manual enablement may be required"
-        }
-    } else {
-        $result.Warnings += "Get-ProcessMitigation unavailable on this OS, will fallback to registry/bcdedit changes where possible"
-    }
-    return $result
-}
-
-function Try-Enable-DEP {
-    # DEP via bcdedit
-    $out = @()
-    try {
-        $bcd = & "$env:SystemRoot\System32\bcdedit.exe" /enum {current} 2>&1
-        $out += $bcd
-        # attempt to set NX policy to OptOut (DEP on by default for system, OptOut covers more)
-        & "$env:SystemRoot\System32\bcdedit.exe" /set {current} nx OptOut 2>$null
-        $out += "bcdedit nx set attempted"
-        return $out
-    } catch {
-        return @("ERROR: DEP bcdedit change failed: $($_.Exception.Message)")
-    }
-}
-
-function Try-Enable-HvciMemoryIntegrity {
-    # Device Guard / HVCI registry keys - we already set these elsewhere; ensure present
-    $vbsRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
-    $hvciRegPath = "$vbsRegPath\Scenarios\HypervisorEnforcedCodeIntegrity"
-    $localResult = @()
-    try {
-        if (-not (Test-Path $hvciRegPath)) { New-Item -Path $hvciRegPath -Force | Out-Null }
-        $currentHvci = (Get-ItemProperty -Path $hvciRegPath -Name "Enabled" -ErrorAction SilentlyContinue).Enabled
-        if ($currentHvci -ne 1) {
-            Set-ItemProperty -Path $hvciRegPath -Name "Enabled" -Value 1 -Type DWord -Force
-            if (-not (Test-Path $vbsRegPath)) { New-Item -Path $vbsRegPath -Force | Out-Null }
-            Set-ItemProperty -Path $vbsRegPath -Name "EnableVirtualizationBasedSecurity" -Value 1 -Type DWord -Force
-            Set-ItemProperty -Path $vbsRegPath -Name "RequirePlatformSecurityFeatures" -Value 1 -Type DWord -Force
-            $localResult += "Memory Integrity (HVCI) set to 1; reboot required"
-            $script:rebootRequired = $true
-        } else {
-            $localResult += "Memory Integrity (HVCI) already ON"
-        }
-    } catch {
-        $localResult += "Failed to configure HVCI: $($_.Exception.Message)"
-    }
-    return $localResult
-}
-
-# Attempt best-effort enables (non-blocking and safe — failures are warnings)
-$mitEnableResults = New-Object System.Collections.Generic.List[string]
-try {
-    $mitEnableResults.AddRange((Try-Enable-ProcessMitigations).Warnings)
-    $mitEnableResults.AddRange((Try-Enable-DEP))
-    $mitEnableResults.AddRange((Try-Enable-HvciMemoryIntegrity))
-} catch { $mitEnableResults.Add("Mitigation enable attempts had exceptions: $($_.Exception.Message)") }
-
-# ---------------------------------------------------------------------------
-# Additional hardening: clear Defender exclusions and registry edits
-# ---------------------------------------------------------------------------
-function Clear-DefenderExclusionsAndPolicies {
-    $results = New-Object System.Collections.Generic.List[string]
-    try {
-        # Use MpPreference where available
-        try {
-            $mpPrefs = Get-MpPreference -ErrorAction Stop
-            $allExclusions = @()
-            if ($mpPrefs.ExclusionPath) { $allExclusions += $mpPrefs.ExclusionPath }
-            if ($mpPrefs.ExclusionExtension) { $allExclusions += $mpPrefs.ExclusionExtension }
-            if ($mpPrefs.ExclusionProcess) { $allExclusions += $mpPrefs.ExclusionProcess }
-
-            if ($allExclusions.Count -gt 0) {
-                $results.Add("Found Defender exclusions: $($allExclusions -join ', ')")
-                try {
-                    foreach ($p in $mpPrefs.ExclusionPath) { Remove-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue }
-                    foreach ($e in $mpPrefs.ExclusionExtension) { Remove-MpPreference -ExclusionExtension $e -ErrorAction SilentlyContinue }
-                    foreach ($pr in $mpPrefs.ExclusionProcess) { Remove-MpPreference -ExclusionProcess $pr -ErrorAction SilentlyContinue }
-                    $results.Add("Cleared Defender exclusions via Remove-MpPreference")
-                } catch { $results.Add("WARNING: couldn't clear all exclusions via Remove-MpPreference: $($_.Exception.Message)") }
-            } else {
-                $results.Add("No Defender exclusions in MpPreference")
-            }
-        } catch {
-            $results.Add("Get-MpPreference unavailable or failed: $($_.Exception.Message)")
-        }
-
-        # Common registry locations for Defender exclusions / policy overrides
-        $regCandidates = @(
-            "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths",
-            "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Extensions",
-            "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes",
-            "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions",
-            "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Paths",
-            "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Extensions",
-            "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Processes"
-        )
-
-        foreach ($rp in $regCandidates) {
-            if (Test-Path $rp) {
-                try {
-                    # backup values to temp (non-destructive backup)
-                    $backupPath = Join-Path $env:TEMP ("defender_exclusions_backup_{0}.reg" -f ([DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")))
-                    # Export-RegistryFile isn't available natively, try reg.exe export
-                    & "$env:SystemRoot\System32\reg.exe" export $rp $backupPath /y 2>$null
-                    Remove-Item -LiteralPath $rp -Recurse -Force -ErrorAction SilentlyContinue
-                    $results.Add("Cleared registry path: $rp (backup: $backupPath)")
-                } catch { $results.Add("Could not clear registry path $rp: $($_.Exception.Message)") }
-            } else {
-                $results.Add("Registry path not present: $rp")
-            }
-        }
-    } catch {
-        $results.Add("Unexpected error while clearing Defender exclusions: $($_.Exception.Message)")
-    }
-    return $results
-}
-
-$defenderClearResults = Clear-DefenderExclusionsAndPolicies
-foreach ($r in $defenderClearResults) { Write-Host "  $r" -ForegroundColor Cyan }
-
-# ---------------------------------------------------------------------------
-# New: Clear shell startup (with backup) and set security services to automatic
-# ---------------------------------------------------------------------------
-function Backup-And-Clear-Startup {
-    $results = New-Object System.Collections.Generic.List[string]
-    try {
-        $userStartup = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
-        $allUsersStartup = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
-
-        $backupRoot = Join-Path $env:TEMP ("ACH_startup_backup_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-        New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-
-        foreach ($target in @($userStartup, $allUsersStartup)) {
-            if (Test-Path $target) {
-                $dest = Join-Path $backupRoot (Split-Path $target -Leaf)
-                try {
-                    Copy-Item -Path $target -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue
-                    Get-ChildItem -Path $target -Force -ErrorAction SilentlyContinue | ForEach-Object {
-                        try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-                    }
-                    $results.Add("Backed up and cleared startup: $target -> $dest")
-                } catch { $results.Add("Failed to backup/clear $target: $($_.Exception.Message)") }
-            } else {
-                $results.Add("Startup path not present: $target")
-            }
-        }
-    } catch {
-        $results.Add("Error during startup clear: $($_.Exception.Message)")
-    }
-    return $results
-}
-
-function Set-SecurityServices-Automatic {
-    $svcList = @(
-        "WinDefend", "WdNisSvc", "WdBoot", "WdFilter",
-        "SecurityHealthService", "WdiServiceHost", "WdiSystemHost",
-        "MpsSvc", "BFE", "EventLog", "Dnscache"
-    )
-    $out = New-Object System.Collections.Generic.List[string]
-    foreach ($svc in $svcList) {
-        try {
-            # set startup type to Automatic if possible
-            try { Set-Service -Name $svc -StartupType Automatic -ErrorAction Stop; $out.Add("Set $svc startup type to Automatic") } catch { $out.Add("Couldn't set $svc startup type: $($_.Exception.Message)") }
-            # attempt to start service
-            try { Start-Service -Name $svc -ErrorAction Stop; $out.Add("Started $svc") } catch { $out.Add("Could not start $svc (may already be running or not present)") }
-        } catch {
-            $out.Add("Error handling service $svc: $($_.Exception.Message)")
-        }
-    }
-    return $out
-}
-
-$startupClearResults = Backup-And-Clear-Startup
-foreach ($s in $startupClearResults) { Write-Host "  $s" -ForegroundColor Cyan }
-
-$serviceAutoResults = Set-SecurityServices-Automatic
-foreach ($s in $serviceAutoResults) { Write-Host "  $s" -ForegroundColor Cyan }
-
 # ---------------------------------------------------------------------------
 # STEP 1: system check
 # ---------------------------------------------------------------------------
@@ -827,7 +607,6 @@ $threatsOutput = @()
 $powershellSigOutput = @()
 $registryAuditOutput = @()
 $psIntegrityOutput = @()
-$mitigationsOutput = @()
 
 # --- Files + modules ---
 
@@ -1280,79 +1059,6 @@ foreach ($serviceName in $serviceNames) {
     $serviceOutput += "$serviceName | status: $status | startup: $startupLabel"
 }
 
-# --- New: Mitigation checks (reporting) ---
-function Query-WindowsMitigations {
-    $out = New-Object System.Collections.Generic.List[string]
-
-    # DEP via bcdedit parsing
-    try {
-        $b = & "$env:SystemRoot\System32\bcdedit.exe" /enum {current} 2>$null
-        $nxLine = $b | Where-Object { $_ -match 'nx' } | Select-Object -First 1
-        if ($nxLine -and $nxLine -match 'nx\s+(\S+)') {
-            $state = $Matches[1]
-            $out.Add("DataExecutionPrevention (NX) : $state")
-        } else {
-            $out.Add("DataExecutionPrevention (NX) : Unknown")
-        }
-    } catch {
-        $out.Add("DataExecutionPrevention (NX) : unavailable ($($_.Exception.Message))")
-    }
-
-    # Try ProcessMitigations (Get-ProcessMitigation -System) where available
-    try {
-        $pm = Get-ProcessMitigation -System -ErrorAction Stop
-        if ($pm) {
-            # Extract common properties if present
-            $props = @(
-                @{Key="ControlFlowGuard"; Path="CfgEnable"},
-                @{Key="BottomUpASLR"; Path="BottomUp"},
-                @{Key="HighEntropyASLR"; Path="HighEntropy"},
-                @{Key="DisableDynamicCode"; Path="DisallowDynamicCode"},
-                @{Key="StrictHandleCheck"; Path="StrictHandleCheck"},
-                @{Key="Win32kSystemCalls"; Path="Win32kSyscallDisable"},
-                @{Key="ArbitraryCodeGuard"; Path="ACG"},
-                @{Key="ValidateExceptionChains"; Path="ValidateExceptionChain"},
-                @{Key="ValidateHeapIntegrity"; Path="ValidateHeap"},
-                @{Key="BlockLowIntegrityImages"; Path="BlockLowIntegrity"},
-                @{Key="BlockRemoteImages"; Path="BlockRemoteImages"},
-                @{Key="KernelModeHardwareEnforcedStackProtection"; Path="KernelModeHardwareEnforcedStackProtection"}
-            )
-
-            foreach ($p in $props) {
-                $key = $p.Key
-                $path = $p.Path
-                $status = "Unknown"
-                if ($pm.PSObject.Properties.Name -contains $path) {
-                    try { $val = $pm.$path; $status = $val } catch {}
-                } else {
-                    # try direct property presence by name
-                    if ($pm.PSObject.Properties.Name -contains $key) {
-                        try { $status = $pm.$key } catch {}
-                    }
-                }
-                $out.Add("$key : $status")
-            }
-        } else {
-            $out.Add("ProcessMitigations : unavailable or returned no system info")
-        }
-    } catch {
-        $out.Add("ProcessMitigations : not available on this OS or access denied")
-    }
-
-    # Check Win32k system call restriction (separate check)
-    try {
-        $reg = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Kernel"
-        $val = (Get-ItemProperty -Path $reg -Name MitigationOptions -ErrorAction SilentlyContinue).MitigationOptions
-        if ($val) { $out.Add("Kernel Mitigations (MitigationOptions) : present") } else { $out.Add("Kernel Mitigations (MitigationOptions) : not set") }
-    } catch {
-        # not fatal
-    }
-
-    return $out
-}
-
-$mitigationsOutput = Query-WindowsMitigations
-
 # --- Print + score step 1 ---
 
 Write-Section "Files + Modules" $modulesOutput
@@ -1368,8 +1074,6 @@ Write-Section "Threats" $threatsOutput
 Write-Section "Binary Signature" $powershellSigOutput
 Write-Section "Defender Registry Audit" $registryAuditOutput
 Write-Section "Required Services" $serviceOutput
-Write-Section "Additional Mitigations (reported)" $mitigationsOutput
-if ($mitEnableResults.Count -gt 0) { Write-Section "Mitigation Enable Attempts" $mitEnableResults }
 
 $allResults = $modulesOutput + $psIntegrityOutput + $windowsOutput + $memoryIntegrityOutput +
     $secureBootOutput + $coreIsolationOutput + $defenderOutput + $antivirusOutput +
@@ -2596,7 +2300,7 @@ function Get-RelativePath {
 
 function Get-FileIntegrity {
     param([Parameter(Mandatory = $true)][string]$Path, [string]$RelativeTo)
-    $resolvedPath = (Resolve-Path -LiteralPath $Path)..Path
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
     $file = Get-Item -LiteralPath $resolvedPath
     $relativePath = if ($RelativeTo) { Get-RelativePath -BasePath $RelativeTo -TargetPath $resolvedPath } else { $file.Name }
 
