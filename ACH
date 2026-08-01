@@ -31,6 +31,35 @@
 - for known cheat signatures while the match is being played, and finally
 - Bundles everything up into a zip for review.
 
+ Version 5.1 Fixes applied:-
+
+- Step 1 now reports and enables system-wide exploit mitigations, the same way it already does for Memory Integrity and
+  Secure Boot.
+- Clears Defender exclusions set via registry-policy keys.
+- Clears shell:startup and the all-users startup folder before a recording
+  session, logging every item removed.
+- A few more security-relevant services (Defender, Security Center, Firewall,
+  Event Log) are checked and set to automatic startup alongside the ones
+  already covered.
+
+ Version 6.1 Fixes applied:-
+
+- Event-driven process-start watcher (Win32_ProcessStartTrace) supplements
+  the 5s poll loop so a process that launches and exits inside that window
+  still gets checked, instead of only on the next scheduled poll.
+- PE-sieve memory-region scanning now also runs against any process flagged
+  by the external-handle check, not just Roblox itself -- that's usually
+  where an external reader/cheat process actually lives.
+- Basic in-memory API hook detection on RobloxPlayerBeta to catch hooking-based
+  cheats that never load as a separate module.
+- Session_monitor.log is now hash-chained, and the chain is verified before
+  packaging, so tampering with an earlier log entry is detectable.
+- Cheat hash/name/string signatures can now be updated from a remote JSON
+  file (off by default, verified against a pinned hash if you set one)
+  instead of requiring a new script version for every new detection.
+- The evidence zip is now password-protected (AES-256 via 7-Zip, when
+  installed) instead of a plain archive.
+
 =====================================================================================
 #>
 
@@ -603,6 +632,8 @@ $coreIsolationOutput = @()
 $defenderOutput = @()
 $antivirusOutput = @()
 $exclusionsOutput = @()
+$mitigationsOutput = @()
+$startupOutput = @()
 $threatsOutput = @()
 $powershellSigOutput = @()
 $registryAuditOutput = @()
@@ -816,8 +847,8 @@ $psIntegrityOutput = $psEnvCheck.Results
 
 try {
     if ($env:OS -eq "Windows_NT" -and (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop)) {
-        $windowsOutput += "SUCCESS: running on Windows"
-    } else { $windowsOutput += "FAILURE: not running on Windows" }
+        $windowsOutput += "SUCCESS: Running on Windows"
+    } else { $windowsOutput += "FAILURE: Not running on Windows" }
 } catch { $windowsOutput += "FAILURE: OS check failed" }
 
 # --- Memory Integrity ---
@@ -871,6 +902,102 @@ try {
     $coreIsolationOutput += "WARNING: Core Isolation status unavailable"
 }
 
+# --- Exploit protection / exploit mitigations ---
+#
+# Two different kinds of settings live here, and they're reported separately
+# so a reviewer can tell which is which:
+#  - System-wide toggles (DEP, ASLR, SEHOP, heap corruption termination, and
+#    CFG on builds that support a system default for it) really do apply to
+#    every process, so these get turned on directly via Set-ProcessMitigation.
+#  - ACG, "block low-integrity images", "block remote images", and disabling
+#    win32k syscalls are *per-process* opt-in mitigations by design (that's
+#    how Microsoft ships them for things like a sandboxed renderer). There is
+#    no supported "apply to all processes" switch for these, and forcing them
+#    globally would break most ordinary Win32 apps rather than stop a cheat.
+#    So this reports them as not-applicable-system-wide instead of quietly
+#    doing something that would take the machine down.
+
+$kernelStackProtRegPath = "$vbsRegPath\Scenarios\KernelShadowStacks"
+try {
+    if (-not (Test-Path $kernelStackProtRegPath)) { New-Item -Path $kernelStackProtRegPath -Force | Out-Null }
+    $currentStackProt = (Get-ItemProperty -Path $kernelStackProtRegPath -Name "Enabled" -ErrorAction SilentlyContinue).Enabled
+    if ($currentStackProt -eq 1) {
+        $mitigationsOutput += "SUCCESS: Kernel-mode Hardware-enforced Stack Protection is ON"
+    } else {
+        try {
+            Set-ItemProperty -Path $kernelStackProtRegPath -Name "Enabled" -Value 1 -Type DWord -Force
+            $mitigationsOutput += "WARNING: Kernel-mode Hardware-enforced Stack Protection was OFF -- enabled, reboot required"
+            $rebootRequired = $true
+        } catch {
+            $mitigationsOutput += "FAILURE: Couldn't enable Kernel-mode Hardware-enforced Stack Protection: $($_.Exception.Message)"
+        }
+    }
+} catch {
+    $mitigationsOutput += "WARNING: Kernel-mode Hardware-enforced Stack Protection unsupported or inaccessible (needs compatible CPU + firmware)"
+}
+
+$vbdRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config"
+try {
+    if (-not (Test-Path $vbdRegPath)) { New-Item -Path $vbdRegPath -Force | Out-Null }
+    $currentBlocklist = (Get-ItemProperty -Path $vbdRegPath -Name "VulnerableDriverBlocklistEnable" -ErrorAction SilentlyContinue).VulnerableDriverBlocklistEnable
+    if ($currentBlocklist -eq 1) {
+        $mitigationsOutput += "SUCCESS: Microsoft Vulnerable Driver Blocklist is ON"
+    } else {
+        try {
+            Set-ItemProperty -Path $vbdRegPath -Name "VulnerableDriverBlocklistEnable" -Value 1 -Type DWord -Force
+            $mitigationsOutput += "WARNING: Vulnerable Driver Blocklist was OFF -- enabled"
+        } catch {
+            $mitigationsOutput += "FAILURE: Couldn't enable Vulnerable Driver Blocklist: $($_.Exception.Message)"
+        }
+    }
+} catch {
+    $mitigationsOutput += "WARNING: Vulnerable Driver Blocklist status unavailable"
+}
+
+try {
+    Set-ProcessMitigation -System -Enable DEP -ErrorAction Stop
+    $mitigationsOutput += "SUCCESS: Data Execution Prevention (system-wide) is ON"
+} catch {
+    $mitigationsOutput += "WARNING: Couldn't set system-wide DEP: $($_.Exception.Message)"
+}
+
+try {
+    Set-ProcessMitigation -System -Enable BottomUp -ErrorAction Stop
+    $mitigationsOutput += "SUCCESS: Bottom-Up ASLR (system-wide) is ON"
+} catch {
+    $mitigationsOutput += "WARNING: Couldn't set system-wide Bottom-Up ASLR: $($_.Exception.Message)"
+}
+
+try {
+    Set-ProcessMitigation -System -Enable HighEntropy -ErrorAction Stop
+    $mitigationsOutput += "SUCCESS: High-Entropy ASLR (system-wide) is ON"
+} catch {
+    $mitigationsOutput += "WARNING: Couldn't set system-wide High-Entropy ASLR: $($_.Exception.Message)"
+}
+
+try {
+    Set-ProcessMitigation -System -Enable SEHOP -ErrorAction Stop
+    $mitigationsOutput += "SUCCESS: SEHOP / exception-chain validation (system-wide) is ON"
+} catch {
+    $mitigationsOutput += "WARNING: Couldn't set system-wide SEHOP: $($_.Exception.Message)"
+}
+
+try {
+    Set-ProcessMitigation -System -Enable TerminateOnError -ErrorAction Stop
+    $mitigationsOutput += "SUCCESS: Heap-corruption termination / heap integrity validation (system-wide) is ON"
+} catch {
+    $mitigationsOutput += "WARNING: Couldn't set system-wide heap integrity validation: $($_.Exception.Message)"
+}
+
+try {
+    Set-ProcessMitigation -System -Enable CFG -ErrorAction Stop
+    $mitigationsOutput += "SUCCESS: Control Flow Guard default (system-wide) is ON"
+} catch {
+    $mitigationsOutput += "INFO: System-wide CFG default not supported on this build (per-app CFG may still be compiled in)"
+}
+
+$mitigationsOutput += "INFO: Arbitrary Code Guard, Block Low-Integrity Images, Block Remote Images, and disabling win32k syscalls are per-process-only mitigations by design -- not forced system-wide because doing so would break most normal Win32 apps rather than stop a cheat"
+
 # --- Windows Defender ---
 
 $WinDefendSvc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
@@ -895,15 +1022,15 @@ function Get-DefenderStatusSafe {
 $defenderStatus = Get-DefenderStatusSafe
 
 if (-not $defenderStatus) {
-    $defenderOutput += "WARNING: couldn't query Defender status"
+    $defenderOutput += "WARNING: Couldn't query Defender status"
 } else {
     if ($defenderStatus.AntivirusEnabled -and $WinDefendSvc -and $WinDefendSvc.Status -eq 'Running') {
         if (-not $defenderStatus.RealTimeProtectionEnabled) {
             try {
                 Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
-                $defenderOutput += "WARNING: realtime protection was OFF -- enabled"
+                $defenderOutput += "WARNING: Realtime protection was OFF -- enabled"
             } catch {
-                $defenderOutput += "WARNING: couldn't re-enable realtime protection: $($_.Exception.Message)"
+                $defenderOutput += "WARNING: Couldn't re-enable realtime protection: $($_.Exception.Message)"
             }
         } else {
             $defenderOutput += "SUCCESS: realtime protection is ON"
@@ -952,10 +1079,60 @@ try {
             $exclusionsOutput += "WARNING: couldn't clear all exclusions: $($_.Exception.Message)"
         }
     } else {
-        $exclusionsOutput += "SUCCESS: no Defender exclusions set"
+        $exclusionsOutput += "SUCCESS: No Defender exclusions set"
     }
 } catch {
-    $exclusionsOutput += "WARNING: couldn't check exclusions"
+    $exclusionsOutput += "WARNING: Couldn't check exclusions"
+}
+
+# --- Defender registry-policy overrides ---
+#
+# Remove-MpPreference above clears exclusions set the normal way. Some tools
+# instead disable Defender by writing policy-style registry values directly
+# (the same keys a domain GPO would use), which Get/Remove-MpPreference won't
+# touch. Clear those too so nothing is quietly disabling Defender underneath
+# the exclusion list.
+
+$defenderPolicyOverrides = @(
+    @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender";                    Name = "DisableAntiSpyware" }
+    @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender";                    Name = "DisableAntiVirus" }
+    @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = "DisableRealtimeMonitoring" }
+    @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = "DisableBehaviorMonitoring" }
+    @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = "DisableOnAccessProtection" }
+    @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = "DisableScanOnRealtimeEnable" }
+    @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet";             Name = "SpyNetReporting" }
+    @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet";             Name = "SubmitSamplesConsent" }
+)
+
+$clearedAnyPolicy = $false
+foreach ($override in $defenderPolicyOverrides) {
+    if (-not (Test-Path $override.Path)) { continue }
+    $existing = Get-ItemProperty -Path $override.Path -Name $override.Name -ErrorAction SilentlyContinue
+    if ($null -eq $existing) { continue }
+    try {
+        Remove-ItemProperty -Path $override.Path -Name $override.Name -Force -ErrorAction Stop
+        $exclusionsOutput += "SUCCESS: cleared Defender policy override '$($override.Name)' at $($override.Path)"
+        $clearedAnyPolicy = $true
+    } catch {
+        $exclusionsOutput += "WARNING: Found Defender policy override '$($override.Name)' at $($override.Path) but couldn't clear it: $($_.Exception.Message)"
+    }
+}
+
+# Also wipe the policy-driven exclusions key (separate from the native
+# ExclusionPath/Extension/Process list Remove-MpPreference already handled).
+$policyExclusionsPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions"
+if (Test-Path $policyExclusionsPath) {
+    try {
+        Remove-Item -Path $policyExclusionsPath -Recurse -Force -ErrorAction Stop
+        $exclusionsOutput += "SUCCESS: Cleared policy-driven Defender exclusions key"
+        $clearedAnyPolicy = $true
+    } catch {
+        $exclusionsOutput += "WARNING: Couldn't clear policy-driven Defender exclusions key: $($_.Exception.Message)"
+    }
+}
+
+if (-not $clearedAnyPolicy) {
+    $exclusionsOutput += "SUCCESS: No Defender registry-policy overrides found"
 }
 
 # --- Threats ---
@@ -965,12 +1142,12 @@ try {
     if ($threats.Count -gt 0) {
         foreach ($t in $threats) { $threatsOutput += "FAILURE: $($t.ThreatName)" }
         try { Start-MpScan -ScanType QuickScan -ErrorAction SilentlyContinue } catch {}
-        $threatsOutput += "WARNING: active threats found -- quick scan triggered"
+        $threatsOutput += "WARNING: Active threats found -- quick scan triggered"
     } else {
-        $threatsOutput += "SUCCESS: no active threats"
+        $threatsOutput += "SUCCESS: No active threats"
     }
 } catch {
-    $threatsOutput += "WARNING: threat scan unavailable"
+    $threatsOutput += "WARNING: Threat scan unavailable"
 }
 
 # --- PowerShell binary signature ---
@@ -989,7 +1166,7 @@ foreach ($psPath in $psExecutablesToCheck) {
             $powershellSigOutput += "FAILURE: $(Split-Path $psPath -Leaf) signature invalid or not Microsoft"
         }
     } catch {
-        $powershellSigOutput += "WARNING: couldn't verify $(Split-Path $psPath -Leaf)"
+        $powershellSigOutput += "WARNING: Couldn't verify $(Split-Path $psPath -Leaf)"
     }
 }
 if ($powershellSigOutput.Count -eq 0) { $powershellSigOutput += "WARNING: no PowerShell executable found to verify" }
@@ -1009,7 +1186,7 @@ function Test-DefenderRegistryPath {
     } catch [System.UnauthorizedAccessException] {
         return "INFO: '$name' exists but is OS-protected (access denied) -- not necessarily a violation"
     } catch {
-        return "WARNING: '$name' couldn't be read: $($_.Exception.Message)"
+        return "WARNING: '$name' Couldn't be read: $($_.Exception.Message)"
     }
 }
 
@@ -1029,7 +1206,7 @@ foreach ($p in $registryPaths) { $registryAuditOutput += Test-DefenderRegistryPa
 
 # --- Required background services ---
 
-$serviceNames = @("DPS", "SysMain", "PcaSvc", "bam")
+$serviceNames = @("DPS", "SysMain", "PcaSvc", "bam", "WinDefend", "WdNisSvc", "wscsvc", "mpssvc", "SecurityHealthService", "EventLog")
 $serviceOutput = @()
 $startupLabels = @{ 0 = "boot"; 1 = "system"; 2 = "automatic"; 3 = "manual"; 4 = "disabled" }
 
@@ -1059,6 +1236,36 @@ foreach ($serviceName in $serviceNames) {
     $serviceOutput += "$serviceName | status: $status | startup: $startupLabel"
 }
 
+# --- Startup items ---
+#
+# Clears both the current user's and the all-users Startup folder
+# (shell:startup / shell:common startup) so nothing auto-launches alongside
+# Windows during a recorded match. This is destructive and not reversible
+# from inside the script, so every removed item's original name is logged
+# here for the record rather than just silently vanishing.
+
+$startupFolders = @(
+    [Environment]::GetFolderPath('Startup'),
+    [Environment]::GetFolderPath('CommonStartup')
+)
+
+foreach ($folder in $startupFolders) {
+    if (-not (Test-Path $folder)) { continue }
+    $items = @(Get-ChildItem -Path $folder -Force -ErrorAction SilentlyContinue)
+    if ($items.Count -eq 0) {
+        $startupOutput += "SUCCESS: $folder already empty"
+        continue
+    }
+    foreach ($item in $items) {
+        try {
+            Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+            $startupOutput += "SUCCESS: Removed '$($item.Name)' from $folder"
+        } catch {
+            $startupOutput += "WARNING: Couldn't remove '$($item.Name)' from $folder`: $($_.Exception.Message)"
+        }
+    }
+}
+
 # --- Print + score step 1 ---
 
 Write-Section "Files + Modules" $modulesOutput
@@ -1067,6 +1274,8 @@ Write-Section "OS Check" $windowsOutput
 Write-Section "Memory Integrity" $memoryIntegrityOutput
 Write-Section "Secure Boot" $secureBootOutput
 Write-Section "Core Isolation" $coreIsolationOutput
+Write-Section "Exploit Mitigations" $mitigationsOutput
+Write-Section "Startup Items" $startupOutput
 Write-Section "Windows Defender" $defenderOutput
 Write-Section "Antivirus Products" $antivirusOutput
 Write-Section "Exclusions" $exclusionsOutput
@@ -1076,7 +1285,7 @@ Write-Section "Defender Registry Audit" $registryAuditOutput
 Write-Section "Required Services" $serviceOutput
 
 $allResults = $modulesOutput + $psIntegrityOutput + $windowsOutput + $memoryIntegrityOutput +
-    $secureBootOutput + $coreIsolationOutput + $defenderOutput + $antivirusOutput +
+    $secureBootOutput + $coreIsolationOutput + $mitigationsOutput + $startupOutput + $defenderOutput + $antivirusOutput +
     $exclusionsOutput + $threatsOutput + $powershellSigOutput + $registryAuditOutput
 
 $total = @($allResults | Where-Object { $_ -match '^(SUCCESS|FAILURE|WARNING)' }).Count
@@ -1112,7 +1321,7 @@ try {
     }
     $step2Success++
 } catch {
-    Write-Host "Error: couldn't access/modify Prefetcher setting." -ForegroundColor Red
+    Write-Host "Error: Couldn't access/modify Prefetcher setting." -ForegroundColor Red
 }
 
 try {
@@ -1499,7 +1708,22 @@ $zipPath = Join-Path $outputRoot "output.zip"
 New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
 
 $monitorLogPath = Join-Path $outputPath "session_monitor.log"
-"Session monitor started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -LiteralPath $monitorLogPath -Encoding utf8
+$firstLine = "Session monitor started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$firstLine | Out-File -LiteralPath $monitorLogPath -Encoding utf8
+
+# Hash-chain the log so a reviewer can tell if a line was edited or removed
+# after the fact: each line's chain hash covers the previous chain hash plus
+# that line's own text, so altering any earlier line breaks every hash after
+# it. This is tamper-evidence, not encryption -- it won't stop someone from
+# editing the file, but it will make the edit detectable.
+function Get-ChainHash {
+    param([string]$PreviousHash, [string]$Line)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("$PreviousHash|$Line")
+    return ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace("-", "")
+}
+$Global:LogChainHash = Get-ChainHash -PreviousHash "GENESIS" -Line $firstLine
+Add-Content -LiteralPath $monitorLogPath -Value "[chain:$Global:LogChainHash]"
 
 # Monitor configuration
 # Default: quiet console output, full details go to the log file.
@@ -1511,6 +1735,17 @@ $Global:PESIEVE_EXPECTED_SHA256 = ""  # populate with pinned hash if you have on
 
 # Known drivers list URL (community-maintained). If unavailable, the driver heuristic will still run.
 $Global:KNOWN_DRIVERS_URL = "https://raw.githubusercontent.com/Neo23x0/LolDrivers/master/loldrivers.json"
+
+# Password for the final evidence zip. NOTE: this is a plaintext secret sitting
+# in a script that (per the header) is distributed to players and posted on
+# GitHub -- anyone with a copy of the script can read this value, so it does
+# NOT actually keep the zip private if the script itself ever leaks or gets
+# shared. It only stops someone who has *just the zip* (e.g. intercepted in
+# transit or found sitting on a shared drive) from opening it casually. If you
+# want "only I can open it" to actually hold even if this script is public,
+# encrypt to your own public key instead (age/GPG) rather than a shared
+# password -- happy to wire that in if you want it.
+$Global:EvidenceZipPassword = "zaid"
 
 # Centralized logging function: always writes full line(s) to the session log.
 # Console printing is minimized by default; set $Global:MonitorQuiet = $false to see full console output.
@@ -1524,7 +1759,9 @@ function Write-MonitorLog {
     $stamped = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Line
 
     try {
+        $Global:LogChainHash = Get-ChainHash -PreviousHash $Global:LogChainHash -Line $stamped
         Add-Content -LiteralPath $monitorLogPath -Value $stamped
+        Add-Content -LiteralPath $monitorLogPath -Value "[chain:$Global:LogChainHash]"
     } catch {
         # don't throw if logging fails
     }
@@ -1544,7 +1781,11 @@ function Write-MonitorLog {
 function Write-MonitorLogRaw {
     param([Parameter(Mandatory = $true)][string[]]$Lines)
     foreach ($l in $Lines) {
-        try { Add-Content -LiteralPath $monitorLogPath -Value $l } catch {}
+        try {
+            $Global:LogChainHash = Get-ChainHash -PreviousHash $Global:LogChainHash -Line $l
+            Add-Content -LiteralPath $monitorLogPath -Value $l
+            Add-Content -LiteralPath $monitorLogPath -Value "[chain:$Global:LogChainHash]"
+        } catch {}
     }
     if (-not $Global:MonitorQuiet) {
         foreach ($l in $Lines) { Write-Host $l -ForegroundColor White }
@@ -1625,6 +1866,63 @@ $KnownCheatNameFragments = @(
     "colorbot", "aimbot", "triggerbot", "autoclicker", "silentaim", "exploit",
     "executor", "lua injector", "warp-service", "warp service"
 )
+
+# --- Remote signature updates (optional, off by default) ---
+#
+# Points at a JSON file you host with the same shape as the hardcoded arrays
+# below: { "hashes": {sha256: label}, "nameFragments": [ ... ], "stringSignatures": { name: [markers] } }
+# so new detections can ship without a new script version. Left blank by
+# default -- set $Global:REMOTE_SIGNATURES_URL to turn this on. Same caution
+# as the LOLDrivers/pe-sieve downloads: pin the SHA-256 once you've reviewed
+# a given signature file, so a compromised host can't silently swap in
+# something else.
+$Global:REMOTE_SIGNATURES_URL = ""
+$Global:REMOTE_SIGNATURES_EXPECTED_SHA256 = ""
+
+function Merge-RemoteCheatSignatures {
+    # Reads/writes the script-scope signature variables directly ($script:)
+    # rather than taking them as parameters, since PowerShell arrays and
+    # hashtables passed by value here would otherwise not propagate reassignments
+    # back to the caller.
+    if (-not $Global:REMOTE_SIGNATURES_URL) { return }
+
+    try {
+        $tempPath = Join-Path $env:TEMP ("ach_sigs_{0}.json" -f (Get-Random))
+        Save-RemoteFile -Uri $Global:REMOTE_SIGNATURES_URL -Path $tempPath
+
+        if ($Global:REMOTE_SIGNATURES_EXPECTED_SHA256) {
+            $actualHash = (Get-FileHash -LiteralPath $tempPath -Algorithm SHA256).Hash
+            if ($actualHash -ne $Global:REMOTE_SIGNATURES_EXPECTED_SHA256) {
+                Write-ColoredLine "[WARN] Remote signature file hash mismatch (got $actualHash) -- ignoring it." Yellow
+                Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                return
+            }
+        } else {
+            Write-ColoredLine "[WARN] No pinned hash set for remote signature file -- merging unverified." Yellow
+        }
+
+        $parsed = Get-Content -LiteralPath $tempPath -Raw | ConvertFrom-Json -ErrorAction Stop
+
+        if ($parsed.hashes) {
+            foreach ($prop in $parsed.hashes.PSObject.Properties) {
+                $script:KnownCheatHashes[$prop.Name.ToUpper()] = $prop.Value
+            }
+        }
+        if ($parsed.nameFragments) {
+            $script:KnownCheatNameFragments = @($script:KnownCheatNameFragments) + @($parsed.nameFragments)
+        }
+        if ($parsed.stringSignatures) {
+            foreach ($prop in $parsed.stringSignatures.PSObject.Properties) {
+                $script:CheatFileStringSignatures[$prop.Name] = @($prop.Value)
+            }
+        }
+
+        Write-ColoredLine "[OK] Merged remote signature updates from $Global:REMOTE_SIGNATURES_URL" Green
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-ColoredLine "[WARN] Couldn't fetch/merge remote signatures: $($_.Exception.Message)" Yellow
+    }
+}
 
 # --- C) Byte-string markers from reviewed samples. Requires 2+ distinct hits
 $CheatFileStringSignatures = @{
@@ -1864,6 +2162,8 @@ $RobloxHandleOwnerAllowlist = @(
     "NVIDIA Share", "nvcontainer", "SteamOverlayRenderer", "XboxGameBarWidgets"
 )
 
+$Global:FlaggedExternalHandlePids = New-Object System.Collections.Generic.HashSet[int]
+
 function Test-ExternalRobloxHandles {
     param($HandleExe)
     if (-not $HandleExe) { return }
@@ -1914,6 +2214,7 @@ function Test-ExternalRobloxHandles {
                 } catch {}
             }
             Write-MonitorLog ("External handle to Roblox logged: {0} (PID {1}) path='{2}'" -f $ownerName, $ownerPid, $ownerPath) Red
+            $null = $Global:FlaggedExternalHandlePids.Add([int]$ownerPid)
         }
     }
 }
@@ -1921,6 +2222,8 @@ function Test-ExternalRobloxHandles {
 Write-Host "Preparing external-handle scanner (Sysinternals Handle)..." -ForegroundColor Cyan
 $handleExe = Get-ForensicTool -Name "Handle" -ZipUrl "https://download.sysinternals.com/files/Handle.zip" -ExeFilter "handle64.exe" -ExcludeMatch @("handle32")
 Write-Host ""
+
+Merge-RemoteCheatSignatures
 
 Write-ColoredLine "MATCH MONITORING ACTIVE" Green
 Write-Host "Play your match now -- this window is logging cheat-signature checks to session_monitor.log." -ForegroundColor White
@@ -1966,14 +2269,14 @@ function Test-KernelDrivers {
             }
         } catch {
             # write fetch warning to the log but don't spam console
-            Write-MonitorLog ("WARNING: couldn't fetch known-driver list: {0}" -f $_.Exception.Message) Yellow
+            Write-MonitorLog ("WARNING: Couldn't fetch known-driver list: {0}" -f $_.Exception.Message) Yellow
         }
     }
 
     try {
         $drivers = Get-CimInstance Win32_SystemDriver -ErrorAction Stop
     } catch {
-        Write-MonitorLog ("WARNING: couldn't enumerate Win32_SystemDriver: {0}" -f $_.Exception.Message) Yellow
+        Write-MonitorLog ("WARNING: Couldn't enumerate Win32_SystemDriver: {0}" -f $_.Exception.Message) Yellow
         return @{
             Summary = "driver-scan-failed"
             SuspectCount = 0
@@ -2083,16 +2386,30 @@ function Test-KernelDrivers {
 # PESieve (memory-region / manual-mapped module) integration
 # ---------------------------
 function Test-PESieveForRoblox {
+    # Scans a process for injected/manual-mapped modules and RWX regions.
+    # Takes either -ProcessName (used for Roblox itself) or -ProcessId
+    # directly, so the same scan can also be pointed at any process that
+    # Test-ExternalRobloxHandles flagged as holding a handle into Roblox --
+    # that's usually where an *external* cheat/reader process actually lives,
+    # not inside Roblox itself.
     param(
-        [string]$ProcessName = "RobloxPlayerBeta"
+        [string]$ProcessName,
+        [int]$ProcessId
     )
 
     $results = New-Object System.Collections.Generic.List[string]
 
-    $proc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $proc) {
-        $results.Add("INFO: $ProcessName not running")
-        return $results
+    $proc = $null
+    if ($ProcessId) {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if (-not $proc) { $results.Add("INFO: PID $ProcessId no longer running"); return $results }
+    } else {
+        if (-not $ProcessName) { $ProcessName = "RobloxPlayerBeta" }
+        $proc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $proc) {
+            $results.Add("INFO: $ProcessName not running")
+            return $results
+        }
     }
 
     if (-not $Global:PESIEVE_URL) {
@@ -2110,11 +2427,11 @@ function Test-PESieveForRoblox {
         try {
             $actual = (Get-FileHash -LiteralPath $pesieveExe.FullName -Algorithm SHA256).Hash
             if ($actual -ne $Global:PESIEVE_EXPECTED_SHA256) {
-                $results.Add("FAIL: pesieve binary hash mismatch (found $actual)")
+                $results.Add("FAIL: Pesieve binary hash mismatch (found $actual)")
                 return $results
             }
         } catch {
-            $results.Add("WARNING: failed to check pesieve hash: $($_.Exception.Message)")
+            $results.Add("WARNING: Failed to check pesieve hash: $($_.Exception.Message)")
         }
     }
 
@@ -2173,7 +2490,7 @@ function Test-PESieveForRoblox {
             }
         }
     } catch {
-        $results.Add("WARNING: couldn't parse pesieve output: $($_.Exception.Message)")
+        $results.Add("WARNING: Couldn't parse pesieve output: $($_.Exception.Message)")
     } finally {
         try { Copy-Item -LiteralPath $jsonOut -Destination (Join-Path $outputPath ("pesieve_{0}.json" -f $proc.Id)) -Force -ErrorAction SilentlyContinue } catch {}
     }
@@ -2182,10 +2499,136 @@ function Test-PESieveForRoblox {
 }
 
 # ---------------------------
+# Basic in-memory API hook detection (ntdll/kernel32) for Roblox
+# ---------------------------
+#
+# Compares the first bytes of a handful of commonly-hooked functions inside
+# RobloxPlayerBeta's mapped ntdll.dll/kernel32.dll against the same bytes at
+# the same address in *this* PowerShell process. System DLLs like ntdll and
+# kernel32 are relocated once per boot and every process maps the same
+# already-relocated copy, so under normal circumstances the bytes at a given
+# function's address should be identical between any two processes on the
+# same running system. A mismatch means something patched the function
+# inside Roblox specifically (a classic API-hooking technique used by
+# hook-based cheats/overlays that never show up as a separate loaded module).
+#
+# Known limitation: this assumes the verifying process (this script) is
+# itself clean, and that both processes see the same relocated base for the
+# system DLL -- true by default, but some additional hardening policies can
+# force independent per-process randomization, which would produce false
+# positives here. Treat hits as a lead for human review, same as everything
+# else in this monitor, not an automatic verdict.
+
+if (-not ([System.Management.Automation.PSTypeName]"AchHookCheck").Type) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class AchHookCheck
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true, BestFitMapping = false, ThrowOnUnmappableChar = true)]
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+}
+"@
+}
+
+$AchHookCheckFunctions = @(
+    @{ Module = "ntdll.dll";    Name = "NtReadVirtualMemory" }
+    @{ Module = "ntdll.dll";    Name = "NtWriteVirtualMemory" }
+    @{ Module = "ntdll.dll";    Name = "NtProtectVirtualMemory" }
+    @{ Module = "ntdll.dll";    Name = "NtQuerySystemInformation" }
+    @{ Module = "kernel32.dll"; Name = "VirtualProtect" }
+    @{ Module = "kernel32.dll"; Name = "CreateRemoteThread" }
+)
+$PROCESS_VM_READ = 0x0010
+$PROCESS_QUERY_INFORMATION = 0x0400
+
+function Test-RobloxApiHooks {
+    param([string]$ProcessName = "RobloxPlayerBeta")
+
+    $proc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $proc) { return }
+
+    $hProcess = [AchHookCheck]::OpenProcess($PROCESS_VM_READ -bor $PROCESS_QUERY_INFORMATION, $false, $proc.Id)
+    if ($hProcess -eq [IntPtr]::Zero) {
+        Write-MonitorLog "Hook scan: couldn't open RobloxPlayerBeta for VM read (insufficient rights or process gone)" Yellow -NoConsole
+        return
+    }
+
+    try {
+        foreach ($target in $AchHookCheckFunctions) {
+            try {
+                $hModule = [AchHookCheck]::GetModuleHandle($target.Module)
+                if ($hModule -eq [IntPtr]::Zero) { continue }
+                $procAddr = [AchHookCheck]::GetProcAddress($hModule, $target.Name)
+                if ($procAddr -eq [IntPtr]::Zero) { continue }
+
+                $localBytes = New-Object byte[] 16
+                [Runtime.InteropServices.Marshal]::Copy($procAddr, $localBytes, 0, 16)
+
+                $remoteBytes = New-Object byte[] 16
+                $bytesRead = 0
+                $ok = [AchHookCheck]::ReadProcessMemory($hProcess, $procAddr, $remoteBytes, 16, [ref]$bytesRead)
+                if (-not $ok -or $bytesRead -lt 16) { continue }
+
+                $differs = $false
+                for ($i = 0; $i -lt 16; $i++) {
+                    if ($localBytes[$i] -ne $remoteBytes[$i]) { $differs = $true; break }
+                }
+
+                if ($differs) {
+                    $localHex = ($localBytes | ForEach-Object { $_.ToString("X2") }) -join " "
+                    $remoteHex = ($remoteBytes | ForEach-Object { $_.ToString("X2") }) -join " "
+                    Write-MonitorLog ("API hook logged in {0}: {1}!{2} differs from clean baseline (clean=[{3}] roblox=[{4}])" -f $ProcessName, $target.Module, $target.Name, $localHex, $remoteHex) Red
+                }
+            } catch {}
+        }
+    } finally {
+        [AchHookCheck]::CloseHandle($hProcess) | Out-Null
+    }
+}
+
+# ---------------------------
 # Monitor main loop
 # ---------------------------
 Show-MonitorStatus
 $lastStatus = Get-Date
+
+# --- Event-driven process-creation watcher ---
+#
+# The poll loop below already does a full sweep every 5s. This registers a
+# real-time WMI trace so a process that launches and exits inside that
+# 5-second window still gets caught immediately, instead of only on the next
+# scheduled poll. Falls back to poll-only detection if registration fails
+# (sandboxed/locked-down environments, WMI service unavailable, etc.) rather
+# than crashing the whole monitor.
+$Global:AchProcessWatcherActive = $false
+try {
+    Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -SourceIdentifier "ACH_ProcessStart" -Action {
+        try {
+            Test-KnownCheatHashes
+            Test-UnconfirmedHashes
+            Test-KnownCheatNames
+            Test-CheatFileStringSignatures
+        } catch {}
+    } -ErrorAction Stop | Out-Null
+    $Global:AchProcessWatcherActive = $true
+    Write-MonitorLog "Event-driven process-start watcher registered." Green -NoConsole
+} catch {
+    Write-MonitorLog ("Event-driven process-start watcher unavailable, relying on poll loop only: {0}" -f $_.Exception.Message) Yellow -NoConsole
+}
 
 while ($true) {
     if ([System.Console]::KeyAvailable) {
@@ -2213,6 +2656,15 @@ while ($true) {
 
     if (((Get-Date) - $lastPesieveScan).TotalSeconds -ge $pesieveScanInterval) {
         Test-PESieveForRoblox -ProcessName "RobloxPlayerBeta"
+        Test-RobloxApiHooks -ProcessName "RobloxPlayerBeta"
+
+        # Also point pe-sieve at anything flagged as holding an external
+        # handle into Roblox -- that's usually where a memory-reading
+        # external cheat actually lives, not inside Roblox itself.
+        foreach ($flaggedPid in @($Global:FlaggedExternalHandlePids)) {
+            Test-PESieveForRoblox -ProcessId $flaggedPid
+        }
+
         $lastPesieveScan = Get-Date
     }
 
@@ -2222,6 +2674,10 @@ while ($true) {
     }
 
     Start-Sleep -Milliseconds 150
+}
+
+if ($Global:AchProcessWatcherActive) {
+    try { Unregister-Event -SourceIdentifier "ACH_ProcessStart" -ErrorAction SilentlyContinue } catch {}
 }
 
 Write-Host ""
@@ -2477,12 +2933,76 @@ Collect-BAM *> $null
 Show-PackagingProgress -Stage "Parsing Amcache"
 Collect-Amcache *> $null
 
+Show-PackagingProgress -Stage "Verifying session log chain"
+function Test-LogChainIntegrity {
+    param([string]$LogPath)
+    if (-not (Test-Path $LogPath)) { return "SKIPPED: log file not found" }
+
+    $lines = Get-Content -LiteralPath $LogPath
+    $running = "GENESIS"
+    $lineNumber = 0
+    for ($i = 0; $i -lt $lines.Count; $i += 2) {
+        $lineNumber++
+        $content_line = $lines[$i]
+        $chainLine = if ($i + 1 -lt $lines.Count) { $lines[$i + 1] } else { $null }
+
+        $expected = Get-ChainHash -PreviousHash $running -Line $content_line
+        $expectedTag = "[chain:$expected]"
+
+        if ($chainLine -ne $expectedTag) {
+            return "FAILURE: chain broken at entry $lineNumber -- log may have been edited or reordered after the fact"
+        }
+        $running = $expected
+    }
+    return "SUCCESS: all $lineNumber log entries verified, chain intact"
+}
+$logChainResult = Test-LogChainIntegrity -LogPath $monitorLogPath
+Save-Text -Name "log_chain_verification.txt" -Data $logChainResult
+
 Show-PackagingProgress -Stage "Generating integrity manifest"
 $manifestPath = Join-Path $outputPath "checksums.txt"
 New-IntegrityManifest -DirectoryPath $outputPath -ManifestPath $manifestPath
 
 Show-PackagingProgress -Stage "Creating zip archive"
-Compress-Archive -Path "$outputPath\*" -DestinationPath $zipPath -CompressionLevel Optimal -Force
+
+# Password-protected zip. Compress-Archive/.NET's ZipFile can't do encrypted
+# zips, so this shells out to 7-Zip (AES-256) if it's installed and falls
+# back to a plain unprotected zip -- with an honest warning -- if it isn't,
+# rather than silently claiming protection that didn't happen.
+function Find-SevenZip {
+    $candidates = @(
+        "$env:ProgramFiles\7-Zip\7z.exe",
+        "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) { return $candidate }
+    }
+    $onPath = Get-Command "7z.exe" -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+    return $null
+}
+
+$sevenZipPath = Find-SevenZip
+$zipIsPasswordProtected = $false
+
+if ($sevenZipPath -and $Global:EvidenceZipPassword) {
+    try {
+        $sevenZipArgs = @(
+            "a", "-tzip", "-mem=AES256", "-p$($Global:EvidenceZipPassword)", "-mmt=on",
+            $zipPath, "$outputPath\*"
+        )
+        & $sevenZipPath @sevenZipArgs | Out-Null
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $zipPath)) {
+            $zipIsPasswordProtected = $true
+        }
+    } catch {
+        $zipIsPasswordProtected = $false
+    }
+}
+
+if (-not $zipIsPasswordProtected) {
+    Compress-Archive -Path "$outputPath\*" -DestinationPath $zipPath -CompressionLevel Optimal -Force
+}
 
 Show-PackagingProgress -Stage "Verifying archive hash"
 $zipCrc32 = Get-Crc32 -Path $zipPath
@@ -2498,6 +3018,12 @@ Write-Host "============================================================" -Foreg
 Write-Host "  Folder   : $outputRoot" -ForegroundColor White
 Write-Host "  File     : $zipPath" -ForegroundColor White
 Write-Host "  SHA256   : $zipSha256" -ForegroundColor White
+if ($zipIsPasswordProtected) {
+    Write-Host "  Password : Protected (AES-256 via 7-Zip)" -ForegroundColor White
+} else {
+    Write-Host "  Password : NOT protected -- 7-Zip wasn't found, so this zip is a plain unencrypted archive" -ForegroundColor Yellow
+}
+Write-Host "  Log chain: $logChainResult" -ForegroundColor White
 Write-Host "============================================================" -ForegroundColor Green
 
 if ($rebootRequired) {
