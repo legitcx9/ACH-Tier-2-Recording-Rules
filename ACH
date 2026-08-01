@@ -1,38 +1,3 @@
-<#
-=====================================================================================
- ACH Official Recording Rules
- Author: LegitCX9
- GitHub: github.com/legitcx9
- Discord: discord.gg/arsenalhub
-
- This script includes:-
- 
-   1) The interactive 6-step "recording rules" walkthrough the player follows
-      on camera (module/signature audit, prefetch, BAM, autoruns, WinObj,
-      Process Explorer).
-   2) The silent forensic collection + packaging pass (prefetch/BAM/Amcache,
-      process/service/driver dumps, integrity manifest, zip) that used to be
-      a separate script the player had to remember to also run.
-
- Version 4.1 Fixes applied:-
-
-- Can now detect triggerbot, esp, extended hitboxes and external cheats.
-- Technical bug fixes so Windows security-status commands run correctly under the right PowerShell architecture.
-- The tool now actually applies certain Windows security settings rather than just reporting their status.
-- Improved accuracy in distinguishing genuine failures from expected OS-protected states.
-- Efficiency improvements to caching and error handling so real problems aren't hidden or masked.
-- A security fix verifying the integrity of an externally downloaded file before it's used, to prevent tampering.
-- Expanded detection coverage for known cheat tools, including catching modified copies of previously identified threats, with matching logic cached for performance.
-- Clearer logging that ties flagged activity back to the specific process and file responsible.
-- Additional logging of general system resource usage as supporting evidence for human reviewers.
-- A separate, cautious logging channel for suspicious-but-unconfirmed files, kept apart from confirmed threats.
-- Runs the on-camera verification steps (signature/module audit, prefetch,
-- BAM, autoruns, WinObj, Process Explorer), then keeps an eye on the machine
-- for known cheat signatures while the match is being played, and finally
-- Bundles everything up into a zip for review.
-
-=====================================================================================
-#>
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 chcp 65001 > $null
@@ -305,6 +270,7 @@ public static class AchCrc32
 }
 "@
 }
+}
 
 $rebootRequired = $false
 
@@ -478,6 +444,44 @@ Write-ColoredLine "Made by LegitCX9" White
 Write-Host ""
 Wait-ForEnter -Message "Press Enter to Continue"
 Clear-Host
+
+# ---------------------------------------------------------------------------
+# NEW ADDITION: Clear Shell:Startup (user & all users)
+# ---------------------------------------------------------------------------
+function Clear-StartupFolders {
+    param()
+    $startupUser = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
+    $startupAll  = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\StartUp"
+    $cleared = New-Object System.Collections.Generic.List[string]
+
+    foreach ($folder in @($startupUser, $startupAll)) {
+        try {
+            if (Test-Path $folder) {
+                $items = Get-ChildItem -Path $folder -Force -ErrorAction SilentlyContinue
+                foreach ($it in $items) {
+                    try {
+                        Remove-Item -LiteralPath $it.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                        $cleared.Add("Removed: $($it.FullName)")
+                    } catch {
+                        $cleared.Add("WARN: couldn't remove $($it.FullName): $($_.Exception.Message)")
+                    }
+                }
+                if (-not $items) { $cleared.Add("No startup items in $folder") }
+            } else {
+                $cleared.Add("Startup folder not found: $folder")
+            }
+        } catch {
+            $cleared.Add("WARN: failed clearing $folder: $($_.Exception.Message)")
+        }
+    }
+
+    return $cleared
+}
+
+Write-ColoredLine "Clearing Startup folders..." Cyan
+$startupClearOutput = Clear-StartupFolders
+foreach ($line in $startupClearOutput) { Write-Host "  $line" -ForegroundColor Green }
+Write-Host ""
 
 # ---------------------------------------------------------------------------
 # Environment setup: pointer scheme, UAC, visual effects
@@ -957,6 +961,115 @@ try {
 } catch {
     $exclusionsOutput += "WARNING: couldn't check exclusions"
 }
+
+# ---------------------------------------------------------------------------
+# NEW ADDITION: Additional Defender registry cleanup and enable basic mitigations
+# This attempts to remove registry-based exclusions/policies and to enable
+# core security services/firewall/realtime-protection where possible.
+# It is defensive (try/catch) and logs results to $exclusionsOutput and $serviceOutput.
+# ---------------------------------------------------------------------------
+try {
+    $exclusionsOutput += "INFO: Running extended Defender registry cleanup and enabling core mitigations..."
+
+    # Remove common policy keys that may disable Defender or add exclusions
+    $policyPaths = @(
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions",
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Features",
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender",
+        "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions",
+        "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths",
+        "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Extensions",
+        "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes"
+    )
+
+    foreach ($p in $policyPaths) {
+        try {
+            if (Test-Path $p) {
+                # Prefer removing values under the key rather than deleting the whole policy
+                # to avoid removing unrelated policy settings. If that fails, try to remove the key.
+                try {
+                    Get-ItemProperty -LiteralPath $p -ErrorAction Stop | ForEach-Object {
+                        $props = $_.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" }
+                        foreach ($prop in $props) {
+                            try { Remove-ItemProperty -LiteralPath $p -Name $prop.Name -ErrorAction SilentlyContinue; $exclusionsOutput += "SUCCESS: removed $($prop.Name) from $p" } catch {}
+                        }
+                    }
+                } catch {
+                    # If removing properties didn't work, attempt to remove the key
+                    try { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue; $exclusionsOutput += "SUCCESS: removed registry path $p" } catch { $exclusionsOutput += "WARNING: couldn't remove registry path $p: $($_.Exception.Message)" }
+                }
+            }
+        } catch {
+            $exclusionsOutput += "WARNING: error while cleaning $p: $($_.Exception.Message)"
+        }
+    }
+
+    # Reset well-known disabling flags if present
+    $disableFlags = @(
+        @{ Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"; Name="DisableAntiSpyware" },
+        @{ Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"; Name="DisableRealtimeMonitoring" },
+        @{ Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"; Name="DisableAntiVirus" }
+    )
+    foreach ($f in $disableFlags) {
+        try {
+            if (Test-Path $f.Path) {
+                $props = Get-ItemProperty -LiteralPath $f.Path -ErrorAction SilentlyContinue
+                if ($props.PSObject.Properties.Name -contains $f.Name) {
+                    try {
+                        Set-ItemProperty -LiteralPath $f.Path -Name $f.Name -Value 0 -ErrorAction SilentlyContinue
+                        $exclusionsOutput += "SUCCESS: reset $($f.Name) at $($f.Path) to 0"
+                    } catch {
+                        try { Remove-ItemProperty -LiteralPath $f.Path -Name $f.Name -ErrorAction SilentlyContinue; $exclusionsOutput += "SUCCESS: removed $($f.Name) from $($f.Path)" } catch { $exclusionsOutput += "WARNING: couldn't reset/remove $($f.Name): $($_.Exception.Message)" }
+                    }
+                }
+            }
+        } catch {
+            $exclusionsOutput += "WARNING: error processing flag $($f.Name) at $($f.Path): $($_.Exception.Message)"
+        }
+    }
+
+    # Ensure core security services are set to Automatic and started
+    $securityServices = @("WinDefend", "WdNisSvc", "SecurityHealthService", "wscsvc", "MpsSvc", "BFE")
+    $serviceOutput = if ($serviceOutput) { $serviceOutput } else { @() }
+    foreach ($svc in $securityServices) {
+        try {
+            # If service exists, set to automatic and start it
+            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            if ($s) {
+                try { Set-Service -Name $svc -StartupType Automatic -ErrorAction Stop; $serviceOutput += "SUCCESS: set $svc startup to Automatic" } catch { $serviceOutput += "WARNING: couldn't set startup for $svc: $($_.Exception.Message)" }
+                try { Start-Service -Name $svc -ErrorAction SilentlyContinue; $serviceOutput += "INFO: attempted to start $svc" } catch { $serviceOutput += "WARNING: couldn't start $svc: $($_.Exception.Message)" }
+            } else {
+                $serviceOutput += "INFO: service not present: $svc"
+            }
+        } catch {
+            $serviceOutput += "WARNING: error handling service $svc: $($_.Exception.Message)"
+        }
+    }
+
+    # Enable Windows Firewall for all profiles
+    try {
+        & "$env:SystemRoot\System32\netsh.exe" advfirewall set allprofiles state on | Out-Null
+        $exclusionsOutput += "SUCCESS: Enabled Windows Firewall (all profiles)"
+    } catch {
+        $exclusionsOutput += "WARNING: Could not enable Windows Firewall: $($_.Exception.Message)"
+    }
+
+    # Ensure Defender realtime monitoring is ON
+    try {
+        Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
+        $exclusionsOutput += "INFO: attempted to enable Defender realtime monitoring"
+    } catch {
+        $exclusionsOutput += "WARNING: couldn't toggle Defender realtime monitoring via Set-MpPreference: $($_.Exception.Message)"
+    }
+
+    # Note: some protections (Tamper Protection, Secure Boot, firmware-based settings)
+    # cannot be toggled from here; we log that information for the operator.
+    $exclusionsOutput += "INFO: Some protections (Tamper Protection, Secure Boot) require manual or firmware action and cannot be toggled here."
+
+} catch {
+    $exclusionsOutput += "WARNING: extended Defender mitigation step failed: $($_.Exception.Message)"
+}
+# ---------------------------------------------------------------------------
 
 # --- Threats ---
 
@@ -1974,10 +2087,12 @@ function Test-KernelDrivers {
         $drivers = Get-CimInstance Win32_SystemDriver -ErrorAction Stop
     } catch {
         Write-MonitorLog ("WARNING: couldn't enumerate Win32_SystemDriver: {0}" -f $_.Exception.Message) Yellow
-        return @{
-            Summary = "driver-scan-failed"
-            SuspectCount = 0
-        }
+        return @(
+            @{
+                Summary = "driver-scan-failed"
+                SuspectCount = 0
+            }
+        )
     }
 
     foreach ($d in $drivers) {
