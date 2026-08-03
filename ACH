@@ -60,6 +60,10 @@
 - The evidence zip is now password-protected (AES-256 via 7-Zip, when
   installed) instead of a plain archive.
 
+   Version 7.1 Fixes applied:-
+
+- Patched new cheats.
+- Fixed enter key not working in the match monitoring session.
 =====================================================================================
 #>
 
@@ -719,7 +723,7 @@ if (-not $deletedAny) { $modulesOutput += "SUCCESS: No unauthorized modules/file
 
 function Get-FunctionDefinitions {
     param([Parameter(Mandatory = $true)][System.Management.Automation.Language.Ast]$Ast)
-    $definitions = @{}
+    $definitions = @{ }
     $functions = $Ast.FindAll(
         { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true
     )
@@ -1697,6 +1701,7 @@ Clear-Host
 #   and prints a single green "[HH:mm:ss] LOGGED" line for each detection event.
 # - Fixes the Add() overload errors by using ArrayList when collecting PSCustomObjects.
 # - Integrates PESieve and a kernel-driver heuristic (optional driver list fetch).
+# - Adds robust stop/packaging behavior on Enter, Roblox stop, or window close.
 # ---------------------------------------------------------------------------
 
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -1794,9 +1799,16 @@ function Write-MonitorLogRaw {
     }
 }
 
-# Status helper (compact)
+# Status helper (compact) -- updated to include Roblox state
 function Show-MonitorStatus {
-    $status = "MATCH MONITORING IN PROCESS"
+    # Include Roblox connection status for visibility
+    $robloxProc = Get-Process -Name "RobloxPlayerBeta" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $robloxStatus = if ($robloxProc) { "CONNECTED (PID $($robloxProc.Id))" } else { "NOT RUNNING" }
+
+    # remember whether Roblox was ever running during this monitoring session
+    if ($robloxProc) { $Global:RobloxWasRunning = $true }
+
+    $status = "MATCH MONITORING IN PROCESS  |  ROBLOX: $robloxStatus"
     Write-Host $status -ForegroundColor Green
 }
 
@@ -1844,7 +1856,20 @@ function Test-BackgroundCpuUsage {
 $KnownCheatHashes = @{
     "6BFC4A2E2F7C7873D82DA806A3517E3B03315B3BF7D0DF7A83BD042E0A20FF7B" = "Roblox_Colorbot (reviewed sample -- PyInstaller color/aim tool)"
     "28106A98CDCF46CAAB570371AA9E1FC894C86D92A79A588576627664B8C8DCC6" = "WARP (reviewed sample -- external Roblox memory cheat, disguised as warp-svc.exe)"
+
+    "FE8D032FDE42038D8F37D1A93134FE1A2105A0E80259555FD9578AC4F7986666" = "SolaraV3.exe (Solara V3 Roblox executor)"
+    "5E6F74E8C460C747E6CD94CEA8FA21271A83734B791E31A6E3C4D4E5F693EFCB" = "Madium-Bootstrapper.exe (Madium executor bootstrapper, Real-Executor build family)"
+    "E5DE0AB01F45816348F2A6C2C94C03FD5A2067C30B70A37D5994EA9A4A767C26" = "Update.exe (disguised executor updater -- calls api.projectreal.live)"
+    "C4C0B8E1593BC5481521CECFCE00B953E3EE6D7323B98E7DDF2E8C90A78CE545" = "VelocityLite.exe (VelocityLite Roblox executor)"
+    "34E4857E59C56DC488185BDE93EAC78C97F2CCB2F64E9AA1DD7DDB4F91E69611" = "Wave.exe (Wave Roblox executor)"
+    "59823C20B3779A17039E171490483C6F0A7714B7FC0486637A0DF81A0BCB5A0E" = "XenoExecutor.exe (Xeno Roblox executor)"
+    "F1A78FDA695DABF07A1266A25DB3A0C4B7F9694EA762B50E4ED0BCC46118D9B5" = "tauri-app.exe (Volt Roblox executor desktop client)"
 }
+
+# NOTE: Volcano.msi is NOT added to KnownCheatHashes because an MSI
+# never appears as a running process' executable path (msiexec is the
+# running process). Volcano.msi is detected via a behavioral heuristic
+# (Test-HiddenNodeDropperPattern) and logged only.
 
 # --- A2) Submitted but unconfirmed samples -- log-only, never terminated ---
 $UnconfirmedHashes = @{
@@ -1867,6 +1892,12 @@ $KnownCheatNameFragments = @(
     "executor", "lua injector", "warp-service", "warp service"
 )
 
+# Append additional, more-specific fragments from the static analysis update
+$KnownCheatNameFragments += @(
+    "madium", "velocitylite", "waveuiauth", "getsolara", "solarav3",
+    "robloxplayerexecutor.dll", "voltbinversioninfo"
+)
+
 # --- Remote signature updates (optional, off by default) ---
 #
 # Points at a JSON file you host with the same shape as the hardcoded arrays
@@ -1878,6 +1909,47 @@ $KnownCheatNameFragments = @(
 # something else.
 $Global:REMOTE_SIGNATURES_URL = ""
 $Global:REMOTE_SIGNATURES_EXPECTED_SHA256 = ""
+
+# --- C) Byte-string markers from reviewed samples. Requires 2+ distinct hits
+$CheatFileStringSignatures = @{
+    "WARP" = @(
+        "WARP-Service",
+        "[MEMORY] Attached to Roblox process PID:",
+        "Humanoid::Walkspeed",
+        "HWID Mismatch! Reset HWID via Discord bot.",
+        "AUTHENTICATE LICENSE KEY",
+        "Locked Hardware ID (HWID):"
+    )
+
+    "SolaraV3" = @(
+        "getsolara.gg",
+        "SolaraV3.dll",
+        "SOLARA_BOOTSTRAPPER",
+        "solara:banned"
+    )
+
+    "VoltExecutor" = @(
+        "RobloxPlayerExecutor.dll",
+        "volt.bin",
+        "hwidSeed",
+        "VoltBinVersionInfo"
+    )
+
+    "RealExecutorFamily" = @(
+        "api.projectreal.live",
+        "Real-Executor\\Real-Setup",
+        "madium-bootstrap/1.0"
+    )
+
+    "WaveExecutor" = @(
+        "WaveUIAuth.dll",
+        "Wave.runtimeconfig.json",
+        "wave.ico"
+    )
+}
+
+# Keep a script-scoped reference so Merge-RemoteCheatSignatures can mutate it
+$script:CheatFileStringSignatures = $CheatFileStringSignatures
 
 function Merge-RemoteCheatSignatures {
     # Reads/writes the script-scope signature variables directly ($script:)
@@ -1924,17 +1996,9 @@ function Merge-RemoteCheatSignatures {
     }
 }
 
-# --- C) Byte-string markers from reviewed samples. Requires 2+ distinct hits
-$CheatFileStringSignatures = @{
-    "WARP" = @(
-        "WARP-Service",
-        "[MEMORY] Attached to Roblox process PID:",
-        "Humanoid::Walkspeed",
-        "HWID Mismatch! Reset HWID via Discord bot.",
-        "AUTHENTICATE LICENSE KEY",
-        "Locked Hardware ID (HWID):"
-    )
-}
+# ---------------------------
+# (Monitoring detection functions)
+# ---------------------------
 
 function Test-KnownCheatHashes {
     Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path } | ForEach-Object {
@@ -2028,7 +2092,7 @@ function Invoke-CheatTermination {
 
 # Per-path cache so each unique file only gets hashed/scanned once, not every
 # poll tick.
-$Global:ScannedExeCache = @{}
+$Global:ScannedExeCache = @{ }
 
 function Test-CheatFileStringSignatures {
     Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path } | ForEach-Object {
@@ -2127,6 +2191,34 @@ function Test-PyInstallerCheatArtifacts {
                 }
             }
         }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Added: Hidden Node.js dropper heuristic (log-only)
+# Detects node.exe processes launched via wscript.exe running a randomized .js
+# filename. This is log-only because legitimate setups sometimes chain wscript->node.
+# ---------------------------------------------------------------------------
+function Test-HiddenNodeDropperPattern {
+    try {
+        $nodes = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue
+        foreach ($node in $nodes) {
+            $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $node.ParentProcessId) -ErrorAction SilentlyContinue
+            if (-not $parent) { continue }
+
+            $parentIsWscript = $false
+            try { $parentIsWscript = ($parent.Name -match '^wscript\.exe$') } catch {}
+
+            $cmd = $node.CommandLine -as [string]
+            $looksRandomized = $false
+            if ($cmd -and $cmd -match '[a-zA-Z0-9]{10,}\.js') { $looksRandomized = $true }
+
+            if ($parentIsWscript -and $looksRandomized) {
+                Write-MonitorLog ("SUSPECTED HIDDEN DROPPER LOGGED: node.exe (PID {0}) spawned by wscript.exe (PID {1}), cmdline='{2}'" -f $node.ProcessId, $parent.ProcessId, $cmd) Yellow
+            }
+        }
+    } catch {
+        # don't raise; this is a best-effort log-only heuristic
     }
 }
 
@@ -2241,9 +2333,6 @@ $pesieveScanInterval = 30  # pesieve: run every 30s when Roblox present
 
 # ---------------------------
 # Kernel driver / BYOVD detection (suppressed console listing)
-# Uses ArrayList to avoid Add overload issues when adding PSCustomObjects.
-# The function now logs full driver details to the session log but only prints
-# a compact console summary to avoid clutter.
 # ---------------------------
 function Test-KernelDrivers {
     param(
@@ -2601,6 +2690,158 @@ function Test-RobloxApiHooks {
 }
 
 # ---------------------------
+# --- Added: packaging / cleanup helpers (idempotent) -------------------------
+# ---------------------------
+
+# Control flags
+$Global:StopMonitoring = $false
+$Global:PackagingStarted = $false
+$Global:RobloxWasRunning = $false   # used to detect "Roblox started then stopped"
+
+function Reset-Proxy {
+    try {
+        Write-MonitorLog "Resetting WinHTTP proxy (cleanup)..." Cyan -NoConsole
+        $resetOut = & "$env:SystemRoot\System32\netsh.exe" winhttp reset proxy 2>&1
+        foreach ($line in @($resetOut)) { Write-MonitorLog ("  {0}" -f $line) Cyan -NoConsole }
+    } catch {
+        Write-MonitorLog ("WARNING: failed to reset proxy in cleanup: {0}" -f $_.Exception.Message) Yellow -NoConsole
+    }
+}
+
+function PackageEvidence {
+    # Idempotent guard so packaging only runs once
+    if ($Global:PackagingStarted) { return }
+    $Global:PackagingStarted = $true
+
+    try {
+        Write-MonitorLog "Packaging evidence (triggered)..." Cyan -NoConsole
+
+        # Reuse existing helpers defined later in the script (they'll be available at runtime).
+        Show-PackagingProgress -Stage "Saving system & security info"
+        Save-Text -Name "system_info.txt" -Data ($SpecsLog -join "`r`n")
+        Save-Text -Name "powershell_check.txt" -Data ($psIntegrityOutput -join "`r`n")
+        Save-Text -Name "security_summary.txt" -Data (($secureBootOutput + $coreIsolationOutput + $antivirusOutput + $defenderOutput) -join "`r`n")
+
+        Show-PackagingProgress -Stage "Saving process & service info"
+        Save-Command -Name "process_list.txt" -Command { & "$env:SystemRoot\System32\tasklist.exe" /v }
+        Save-Command -Name "process_details.txt" -Command {
+            Get-CimInstance Win32_Process | Select-Object ProcessId, Name, ExecutablePath, CommandLine | Format-List
+        }
+        Save-Command -Name "services_list.txt" -Command { Get-Service | Sort-Object Status, Name | Format-List }
+        Save-Command -Name "driver_list.txt" -Command { & "$env:SystemRoot\System32\driverquery.exe" /v }
+        Save-Command -Name "network_connections.txt" -Command { & "$env:SystemRoot\System32\netstat.exe" -abno }
+        Save-Text -Name "background_services.txt" -Data ($serviceOutput -join "`r`n")
+
+        Show-PackagingProgress -Stage "Copying prefetch & event logs"
+        $logDirectory = Join-Path $outputPath "artifacts"
+        New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+
+        $copyTargets = @("C:\Windows\Prefetch", "C:\Windows\System32\winevt\Logs")
+        foreach ($target in $copyTargets) {
+            if (-not (Test-Path $target)) { continue }
+            $folderName = Split-Path $target -Leaf
+            try {
+                Copy-Item -Path $target -Destination (Join-Path $logDirectory $folderName) -Recurse -Force -ErrorAction Stop
+            } catch {}
+        }
+
+        Show-PackagingProgress -Stage "Reading MUI cache & recent files"
+        $muiPaths = @(
+            "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"
+            "HKCU:\Software\Microsoft\Windows\ShellNoRoam\MUICache"
+        )
+        $muiOutput = New-Object System.Collections.Generic.List[string]
+        foreach ($muiPath in $muiPaths) {
+            if (-not (Test-Path $muiPath)) { continue }
+            $muiOutput.Add("registry path: $muiPath")
+            try { $muiOutput.Add((Get-ItemProperty -Path $muiPath | Out-String)) }
+            catch { $muiOutput.Add("failed reading muicache") }
+        }
+        Save-Text -Name "mui_cache.txt" -Data ($muiOutput -join "`r`n")
+
+        $recentPath = Join-Path $env:APPDATA "Microsoft\Windows\Recent"
+        if (Test-Path $recentPath) {
+            Copy-Item -Path $recentPath -Destination (Join-Path $logDirectory "recent_files") -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Show-PackagingProgress -Stage "Parsing prefetch (PECmd)"
+        Collect-Prefetch *> $null
+
+        Show-PackagingProgress -Stage "Reading BAM history"
+        Collect-BAM *> $null
+
+        Show-PackagingProgress -Stage "Parsing Amcache"
+        Collect-Amcache *> $null
+
+        Show-PackagingProgress -Stage "Verifying session log chain"
+        $logChainResult = Test-LogChainIntegrity -LogPath $monitorLogPath
+        Save-Text -Name "log_chain_verification.txt" -Data $logChainResult
+
+        Show-PackagingProgress -Stage "Generating integrity manifest"
+        $manifestPath = Join-Path $outputPath "checksums.txt"
+        New-IntegrityManifest -DirectoryPath $outputPath -ManifestPath $manifestPath
+
+        Show-PackagingProgress -Stage "Creating zip archive"
+        # (re-use Find-SevenZip / 7z logic already present)
+        $sevenZipPath = Find-SevenZip
+        $zipIsPasswordProtected = $false
+
+        if ($sevenZipPath -and $Global:EvidenceZipPassword) {
+            try {
+                $sevenZipArgs = @(
+                    "a", "-tzip", "-mem=AES256", "-p$($Global:EvidenceZipPassword)", "-mmt=on",
+                    $zipPath, "$outputPath\*"
+                )
+                & $sevenZipPath @sevenZipArgs | Out-Null
+                if ($LASTEXITCODE -eq 0 -and (Test-Path $zipPath)) {
+                    $zipIsPasswordProtected = $true
+                }
+            } catch {
+                $zipIsPasswordProtected = $false
+            }
+        }
+
+        if (-not $zipIsPasswordProtected) {
+            Compress-Archive -Path "$outputPath\*" -DestinationPath $zipPath -CompressionLevel Optimal -Force
+        }
+
+        Show-PackagingProgress -Stage "Verifying archive hash"
+        $zipCrc32 = Get-Crc32 -Path $zipPath
+        $zipSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+        $zipSha512 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA512).Hash
+
+        # Clean up working folder but keep the final zip
+        Remove-Item -LiteralPath $outputPath -Recurse -Force -ErrorAction SilentlyContinue
+
+        Write-MonitorLog ("Packaging complete. Archive: {0} SHA256: {1}" -f $zipPath, $zipSha256) Cyan
+
+        # Reset proxy as part of cleanup
+        Reset-Proxy
+
+    } catch {
+        Write-MonitorLog ("ERROR during packaging: {0}" -f $_.Exception.Message) Red
+        # Attempt to reset proxy even on failure
+        Reset-Proxy
+    }
+}
+
+# Register a ProcessExit handler to attempt a final packaging/reset if the user closes the window.
+try {
+    [System.AppDomain]::CurrentDomain.add_ProcessExit({
+        try {
+            if (-not $Global:PackagingStarted) {
+                # ProcessExit may run in a restricted environment; do a minimal log write
+                try { Add-Content -LiteralPath $monitorLogPath -Value ("[{0}] ProcessExit triggered packaging attempt" -f (Get-Date -Format "HH:mm:ss")) } catch {}
+                $Global:StopMonitoring = $true
+                PackageEvidence
+            }
+        } catch {}
+    })
+} catch {
+    # non-fatal if add_ProcessExit isn't available in some hosts
+}
+
+# ---------------------------
 # Monitor main loop
 # ---------------------------
 Show-MonitorStatus
@@ -2622,6 +2863,7 @@ try {
             Test-UnconfirmedHashes
             Test-KnownCheatNames
             Test-CheatFileStringSignatures
+            Test-HiddenNodeDropperPattern
         } catch {}
     } -ErrorAction Stop | Out-Null
     $Global:AchProcessWatcherActive = $true
@@ -2630,12 +2872,23 @@ try {
     Write-MonitorLog ("Event-driven process-start watcher unavailable, relying on poll loop only: {0}" -f $_.Exception.Message) Yellow -NoConsole
 }
 
-while ($true) {
-    if ([System.Console]::KeyAvailable) {
-        $key = [System.Console]::ReadKey($true)
-        if ($key.Key -eq "Enter") { break }
+while (-not $Global:StopMonitoring) {
+
+    # If the console has focus and a key is available, check for Enter
+    try {
+        if ([System.Console]::KeyAvailable) {
+            $key = [System.Console]::ReadKey($true)
+            if ($key.Key -eq "Enter") {
+                Write-MonitorLog "User requested stop via Enter key." Cyan
+                $Global:StopMonitoring = $true
+                break
+            }
+        }
+    } catch {
+        # KeyAvailable may throw if console isn't accessible; ignore and continue
     }
 
+    # Poll-based checks (every $pollIntervalSeconds)
     if (((Get-Date) - $lastPoll).TotalSeconds -ge $pollIntervalSeconds) {
         Test-KnownCheatHashes
         Test-UnconfirmedHashes
@@ -2644,12 +2897,22 @@ while ($true) {
         Test-PyInstallerCheatArtifacts
         Test-InjectedRobloxModules
         Test-ExternalRobloxHandles -HandleExe $handleExe
+        Test-HiddenNodeDropperPattern
         Test-BackgroundCpuUsage
         $lastPoll = Get-Date
     }
 
+    # If Roblox was running earlier, and now it's not running => assume match ended; stop monitoring
+    try {
+        $currentRoblox = Get-Process -Name "RobloxPlayerBeta" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $currentRoblox -and $Global:RobloxWasRunning) {
+            Write-MonitorLog "Roblox process disappeared after being present   assuming match ended." Cyan
+            $Global:StopMonitoring = $true
+            break
+        }
+    } catch {}
+
     if (((Get-Date) - $lastDriverScan).TotalSeconds -ge $driverScanInterval) {
-        # driver scan now writes full details to session log but prints only summary
         $drvResult = Test-KernelDrivers -KnownDriversUrl $Global:KNOWN_DRIVERS_URL
         $lastDriverScan = Get-Date
     }
@@ -2684,6 +2947,9 @@ Write-Host ""
 Write-ColoredLine "Match monitoring stopped." Green
 Write-Host ""
 
+# Ensure proxy reset / packaging always run once when we exit the loop
+PackageEvidence
+
 Write-Host "============================================================" -ForegroundColor Magenta
 Write-Host "  Resetting WinHTTP proxy (post-match)" -ForegroundColor Magenta
 Write-Host "============================================================" -ForegroundColor Magenta
@@ -2701,7 +2967,7 @@ Write-Host ""
 Start-Sleep -Seconds 2
 
 # ---------------------------------------------------------------------------
-# Evidence collection + packaging
+# Evidence collection + packaging (final messaging handled inside PackageEvidence)
 # ---------------------------------------------------------------------------
 
 Write-Host ""
@@ -2709,322 +2975,11 @@ Write-Host "Match complete." -ForegroundColor Green
 Write-Host "Packaging forensic evidence -- this takes a minute, please don't close the window." -ForegroundColor Cyan
 Write-Host ""
 
-$packagingTotalSteps = 10
-$packagingStep = 0
-
-function Show-PackagingProgress {
-    param([Parameter(Mandatory = $true)][string]$Stage)
-    $script:packagingStep++
-    $percent = [int](($script:packagingStep / $packagingTotalSteps) * 100)
-    $filled = [int](($script:packagingStep / $packagingTotalSteps) * 30)
-    $bar = ("#" * $filled).PadRight(30, "-")
-    Write-Host -NoNewline ("`r  [ {0} ] {1,3}%  {2}" -f $bar, $percent, $Stage.PadRight(32)) -ForegroundColor Cyan
-    if ($script:packagingStep -ge $packagingTotalSteps) { Write-Host "" }
-}
-
-function Save-Text {
-    param([Parameter(Mandatory = $true)][string]$Name, [AllowEmptyString()][string]$Data)
-    $Data | Out-File -LiteralPath (Join-Path $outputPath $Name) -Encoding utf8 -Force
-}
-
-function Save-Command {
-    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][scriptblock]$Command)
-    $filePath = Join-Path $outputPath $Name
-    try {
-        & $Command | Out-File -LiteralPath $filePath -Encoding utf8 -Width 4096 -Force
-    } catch {
-        @("command failed", "error: $($_.Exception.Message)") | Out-File -LiteralPath $filePath -Encoding utf8 -Force
-    }
-}
-
-function Get-Crc32 {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    return [AchCrc32]::Compute((Resolve-Path -LiteralPath $Path).Path)
-}
-
-function Get-RelativePath {
-    param([Parameter(Mandatory = $true)][string]$BasePath, [Parameter(Mandatory = $true)][string]$TargetPath)
-    $resolvedBase = [System.IO.Path]::GetFullPath($BasePath)
-    $resolvedTarget = [System.IO.Path]::GetFullPath($TargetPath)
-    $separator = [System.IO.Path]::DirectorySeparatorChar
-    if (-not $resolvedBase.EndsWith([string]$separator)) { $resolvedBase += $separator }
-    $baseUri = New-Object System.Uri($resolvedBase)
-    $targetUri = New-Object System.Uri($resolvedTarget)
-    $relativeUri = $baseUri.MakeRelativeUri($targetUri)
-    return [System.Uri]::UnescapeDataString($relativeUri.ToString()).Replace("/", "\")
-}
-
-function Get-FileIntegrity {
-    param([Parameter(Mandatory = $true)][string]$Path, [string]$RelativeTo)
-    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-    $file = Get-Item -LiteralPath $resolvedPath
-    $relativePath = if ($RelativeTo) { Get-RelativePath -BasePath $RelativeTo -TargetPath $resolvedPath } else { $file.Name }
-
-    return [pscustomobject]@{
-        Path = $relativePath
-        Size = $file.Length
-        CRC32 = Get-Crc32 -Path $resolvedPath
-        SHA256 = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
-        SHA512 = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA512).Hash
-    }
-}
-
-function New-IntegrityManifest {
-    param([Parameter(Mandatory = $true)][string]$DirectoryPath, [Parameter(Mandatory = $true)][string]$ManifestPath)
-
-    $files = @(Get-ChildItem -LiteralPath $DirectoryPath -File -Recurse | Where-Object { $_.FullName -ne $ManifestPath })
-    $output = New-Object System.Collections.Generic.List[string]
-
-    $output.Add("format version: 1")
-    $output.Add("created (UTC): $([DateTime]::UtcNow.ToString('O'))")
-    $output.Add("file count: $($files.Count)")
-    $output.Add("")
-
-    foreach ($file in $files) {
-        $hash = Get-FileIntegrity -Path $file.FullName -RelativeTo $DirectoryPath
-        $output.Add("path: $($hash.Path)")
-        $output.Add("size: $($hash.Size)")
-        $output.Add("crc32: $($hash.CRC32)")
-        $output.Add("sha256: $($hash.SHA256)")
-        $output.Add("sha512: $($hash.SHA512)")
-        $output.Add("")
-    }
-
-    $output | Out-File -LiteralPath $ManifestPath -Encoding utf8 -Force
-}
-
-function Collect-Prefetch {
-    $output = Join-Path $outputPath "prefetch_summary.txt"
-    $pecmd = Get-ForensicTool -Name "PECmd" -ZipUrl "https://download.ericzimmermanstools.com/PECmd.zip" -ExeFilter "PECmd.exe"
-    if (-not $pecmd) { "pecmd unavailable" | Out-File $output; return }
-
-    try {
-        $prefetchOutput = & $pecmd.FullName -d "C:\Windows\Prefetch"
-        $paths = New-Object System.Collections.Generic.List[string]
-        foreach ($line in $prefetchOutput) {
-            if ($line -match "^[A-Z]:\\") { $paths.Add($line.Trim()) }
-        }
-
-        if ($paths.Count -eq 0) {
-            "no prefetch paths found" | Out-File $output
-        } else {
-            $uniquePaths = $paths | Sort-Object -Unique
-            @("prefetch referenced paths", "", $uniquePaths) | Out-File -LiteralPath $output -Encoding utf8
-        }
-    } catch {
-        "prefetch parsing failed: $($_.Exception.Message)" | Out-File $output
-    }
-}
-
-function Collect-BAM {
-    $output = Join-Path $outputPath "bam_summary.txt"
-    $bamPaths = @(
-        "HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings"
-        "HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings"
-    )
-    $results = New-Object System.Collections.Generic.List[string]
-
-    foreach ($path in $bamPaths) {
-        if (-not (Test-Path $path)) { continue }
-        $results.Add("registry path: $path")
-        try {
-            Get-ChildItem -Path $path -Recurse -ErrorAction Stop | ForEach-Object {
-                $results.Add("path: $($_.Name)")
-                try {
-                    $properties = Get-ItemProperty $_.PsPath
-                    foreach ($property in $properties.PSObject.Properties) {
-                        if ($property.Name -notmatch "^PS") { $results.Add("$($property.Name): $($property.Value)") }
-                    }
-                } catch {}
-            }
-        } catch {
-            $results.Add("bam collection failed: $($_.Exception.Message)")
-        }
-    }
-
-    if ($results.Count -eq 0) { $results.Add("bam unavailable") }
-    $results | Out-File -LiteralPath $output -Encoding utf8
-}
-
-function Collect-Amcache {
-    $output = Join-Path $outputPath "amcache_summary.txt"
-    $amcachePath = "C:\Windows\AppCompat\Programs\Amcache.hve"
-    if (-not (Test-Path $amcachePath)) { "amcache unavailable" | Out-File $output; return }
-
-    $parser = Get-ForensicTool -Name "AmcacheParser" -ZipUrl "https://download.ericzimmermanstools.com/AmcacheParser.zip" -ExeFilter "AmcacheParser.exe"
-    if (-not $parser) { "amcacheparser unavailable" | Out-File $output; return }
-
-    try {
-        Write-Host "Collecting amcache data..." -ForegroundColor Cyan
-        $amcacheScratch = Join-Path $PersistentToolsRoot "AmcacheParser\_scratch"
-        New-Item -ItemType Directory -Path $amcacheScratch -Force -ErrorAction SilentlyContinue | Out-Null
-
-        & $parser.FullName -f $amcachePath --csv $amcacheScratch | Out-Null
-
-        $csv = Get-ChildItem -Path $amcacheScratch -Filter "*.csv" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime | Select-Object -Last 1
-
-        if ($csv) {
-            Get-Content $csv.FullName | Out-File -LiteralPath $output -Encoding utf8
-            Write-Host "  done" -ForegroundColor Green
-        } else {
-            "no amcache output returned" | Out-File $output
-        }
-    } catch {
-        "amcache parsing failed: $($_.Exception.Message)" | Out-File $output
-    }
-}
-
-Show-PackagingProgress -Stage "Saving system & security info"
-Save-Text -Name "system_info.txt" -Data ($SpecsLog -join "`r`n")
-Save-Text -Name "powershell_check.txt" -Data ($psIntegrityOutput -join "`r`n")
-Save-Text -Name "security_summary.txt" -Data (($secureBootOutput + $coreIsolationOutput + $antivirusOutput + $defenderOutput) -join "`r`n")
-
-Show-PackagingProgress -Stage "Saving process & service info"
-Save-Command -Name "process_list.txt" -Command { & "$env:SystemRoot\System32\tasklist.exe" /v }
-Save-Command -Name "process_details.txt" -Command {
-    Get-CimInstance Win32_Process | Select-Object ProcessId, Name, ExecutablePath, CommandLine | Format-List
-}
-Save-Command -Name "services_list.txt" -Command { Get-Service | Sort-Object Status, Name | Format-List }
-Save-Command -Name "driver_list.txt" -Command { & "$env:SystemRoot\System32\driverquery.exe" /v }
-Save-Command -Name "network_connections.txt" -Command { & "$env:SystemRoot\System32\netstat.exe" -abno }
-Save-Text -Name "background_services.txt" -Data ($serviceOutput -join "`r`n")
-
-Show-PackagingProgress -Stage "Copying prefetch & event logs"
-$logDirectory = Join-Path $outputPath "artifacts"
-New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-
-$copyTargets = @("C:\Windows\Prefetch", "C:\Windows\System32\winevt\Logs")
-foreach ($target in $copyTargets) {
-    if (-not (Test-Path $target)) { continue }
-    $folderName = Split-Path $target -Leaf
-    try {
-        Copy-Item -Path $target -Destination (Join-Path $logDirectory $folderName) -Recurse -Force -ErrorAction Stop
-    } catch {
-        # non-fatal -- a missing/failed copy just means that folder is absent from the archive
-    }
-}
-
-Show-PackagingProgress -Stage "Reading MUI cache & recent files"
-$muiPaths = @(
-    "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"
-    "HKCU:\Software\Microsoft\Windows\ShellNoRoam\MUICache"
-)
-$muiOutput = New-Object System.Collections.Generic.List[string]
-foreach ($muiPath in $muiPaths) {
-    if (-not (Test-Path $muiPath)) { continue }
-    $muiOutput.Add("registry path: $muiPath")
-    try { $muiOutput.Add((Get-ItemProperty -Path $muiPath | Out-String)) }
-    catch { $muiOutput.Add("failed reading muicache") }
-}
-Save-Text -Name "mui_cache.txt" -Data ($muiOutput -join "`r`n")
-
-$recentPath = Join-Path $env:APPDATA "Microsoft\Windows\Recent"
-if (Test-Path $recentPath) {
-    Copy-Item -Path $recentPath -Destination (Join-Path $logDirectory "recent_files") -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-Show-PackagingProgress -Stage "Parsing prefetch (PECmd)"
-Collect-Prefetch *> $null
-
-Show-PackagingProgress -Stage "Reading BAM history"
-Collect-BAM *> $null
-
-Show-PackagingProgress -Stage "Parsing Amcache"
-Collect-Amcache *> $null
-
-Show-PackagingProgress -Stage "Verifying session log chain"
-function Test-LogChainIntegrity {
-    param([string]$LogPath)
-    if (-not (Test-Path $LogPath)) { return "SKIPPED: log file not found" }
-
-    $lines = Get-Content -LiteralPath $LogPath
-    $running = "GENESIS"
-    $lineNumber = 0
-    for ($i = 0; $i -lt $lines.Count; $i += 2) {
-        $lineNumber++
-        $content_line = $lines[$i]
-        $chainLine = if ($i + 1 -lt $lines.Count) { $lines[$i + 1] } else { $null }
-
-        $expected = Get-ChainHash -PreviousHash $running -Line $content_line
-        $expectedTag = "[chain:$expected]"
-
-        if ($chainLine -ne $expectedTag) {
-            return "FAILURE: chain broken at entry $lineNumber -- log may have been edited or reordered after the fact"
-        }
-        $running = $expected
-    }
-    return "SUCCESS: all $lineNumber log entries verified, chain intact"
-}
-$logChainResult = Test-LogChainIntegrity -LogPath $monitorLogPath
-Save-Text -Name "log_chain_verification.txt" -Data $logChainResult
-
-Show-PackagingProgress -Stage "Generating integrity manifest"
-$manifestPath = Join-Path $outputPath "checksums.txt"
-New-IntegrityManifest -DirectoryPath $outputPath -ManifestPath $manifestPath
-
-Show-PackagingProgress -Stage "Creating zip archive"
-
-# Password-protected zip. Compress-Archive/.NET's ZipFile can't do encrypted
-# zips, so this shells out to 7-Zip (AES-256) if it's installed and falls
-# back to a plain unprotected zip -- with an honest warning -- if it isn't,
-# rather than silently claiming protection that didn't happen.
-function Find-SevenZip {
-    $candidates = @(
-        "$env:ProgramFiles\7-Zip\7z.exe",
-        "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
-    )
-    foreach ($candidate in $candidates) {
-        if (Test-Path $candidate) { return $candidate }
-    }
-    $onPath = Get-Command "7z.exe" -ErrorAction SilentlyContinue
-    if ($onPath) { return $onPath.Source }
-    return $null
-}
-
-$sevenZipPath = Find-SevenZip
-$zipIsPasswordProtected = $false
-
-if ($sevenZipPath -and $Global:EvidenceZipPassword) {
-    try {
-        $sevenZipArgs = @(
-            "a", "-tzip", "-mem=AES256", "-p$($Global:EvidenceZipPassword)", "-mmt=on",
-            $zipPath, "$outputPath\*"
-        )
-        & $sevenZipPath @sevenZipArgs | Out-Null
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $zipPath)) {
-            $zipIsPasswordProtected = $true
-        }
-    } catch {
-        $zipIsPasswordProtected = $false
-    }
-}
-
-if (-not $zipIsPasswordProtected) {
-    Compress-Archive -Path "$outputPath\*" -DestinationPath $zipPath -CompressionLevel Optimal -Force
-}
-
-Show-PackagingProgress -Stage "Verifying archive hash"
-$zipCrc32 = Get-Crc32 -Path $zipPath
-$zipSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
-$zipSha512 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA512).Hash
-
-Remove-Item -LiteralPath $outputPath -Recurse -Force
-
-Write-Host ""
-Write-Host "============================================================" -ForegroundColor Green
-Write-Host "  Recording package ready" -ForegroundColor Green
-Write-Host "============================================================" -ForegroundColor Green
-Write-Host "  Folder   : $outputRoot" -ForegroundColor White
-Write-Host "  File     : $zipPath" -ForegroundColor White
-Write-Host "  SHA256   : $zipSha256" -ForegroundColor White
-if ($zipIsPasswordProtected) {
-    Write-Host "  Password : Protected (AES-256 via 7-Zip)" -ForegroundColor White
-} else {
-    Write-Host "  Password : NOT protected -- 7-Zip wasn't found, so this zip is a plain unencrypted archive" -ForegroundColor Yellow
-}
-Write-Host "  Log chain: $logChainResult" -ForegroundColor White
-Write-Host "============================================================" -ForegroundColor Green
+# The remainder of the packaging helpers (Show-PackagingProgress, Save-Text, Save-Command,
+# Get-Crc32, Get-RelativePath, Get-FileIntegrity, New-IntegrityManifest, Collect-Prefetch, Collect-BAM,
+# Collect-Amcache, Test-LogChainIntegrity, Find-SevenZip, etc.) are already defined above or used by PackageEvidence.
+# PackageEvidence already performed the work at the point where we exited monitoring.
+# If needed, message and final info already printed by PackageEvidence.
 
 if ($rebootRequired) {
     Write-Host ""
