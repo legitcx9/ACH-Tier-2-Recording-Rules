@@ -161,7 +161,18 @@ function Write-Section {
 function Save-RemoteFile {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        # Every caller of this used to inherit whatever the default .NET
+        # connect/read timeout happens to be, which on a flaky or
+        # DNS-filtered network (school/dorm wifi, some AV/firewalls block
+        # pastebin.com specifically) can sit for a long time before finally
+        # giving up. That's fine when it's a one-off step, but this same
+        # helper backs Get-ForensicTool -- and one of those tools
+        # (Test-KernelDrivers' known-driver list) gets re-fetched every 60s
+        # for the whole match, INSIDE the monitoring loop, blocking the
+        # Enter-key check until it returns. Bounding it here means a bad
+        # network costs at most ~2x this many seconds, not minutes.
+        [int]$TimeoutSec = 10
     )
     $parent = Split-Path -Parent $Path
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
@@ -172,13 +183,19 @@ function Save-RemoteFile {
         # Resolve the cmdlet by its module-qualified name so a tampered profile
         # alias can't quietly redirect this download.
         $webRequestCmd = Get-Command -Name Invoke-WebRequest -CommandType Cmdlet -ErrorAction Stop
-        & "$($webRequestCmd.Source)\Invoke-WebRequest" -Uri $Uri -OutFile $Path -UseBasicParsing -ErrorAction Stop
+        & "$($webRequestCmd.Source)\Invoke-WebRequest" -Uri $Uri -OutFile $Path -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
         return
     } catch {
         $client = $null
         try {
             $client = New-Object System.Net.WebClient
-            $client.DownloadFile($Uri, $Path)
+            $downloadTask = $client.DownloadFileTaskAsync($Uri, $Path)
+            if (-not $downloadTask.Wait([TimeSpan]::FromSeconds($TimeoutSec))) {
+                throw "timed out after ${TimeoutSec}s (network unreachable or DNS blocked '$([Uri]::new($Uri).Host)')"
+            }
+            if ($downloadTask.IsFaulted) {
+                throw $downloadTask.Exception.InnerException
+            }
         } catch {
             throw "Could not download $Uri to $Path. $($_.Exception.Message)"
         } finally {
@@ -216,9 +233,26 @@ function Get-ForensicTool {
         }
     }
 
-    if (Test-Path $toolRoot) {
-        $existingExe = & $filterExisting (Get-ChildItem -Path $toolRoot -Filter $ExeFilter -Recurse -ErrorAction SilentlyContinue) |
+    # Shared by both the "already cached" check below and the post-extraction
+    # check further down, so a naming drift in the release zip (version
+    # suffix, arch tag, casing) is handled the same way in both places
+    # instead of only on a fresh download.
+    $findExe = {
+        param($root, $filter)
+        $found = & $filterExisting (Get-ChildItem -Path $root -Filter $filter -Recurse -ErrorAction SilentlyContinue) |
             Select-Object -First 1
+        if ($found) { return $found }
+
+        $stem = [System.IO.Path]::GetFileNameWithoutExtension($filter) -replace '[\d\.]+$', ''
+        if ($stem) {
+            $found = & $filterExisting (Get-ChildItem -Path $root -Filter "*$stem*.exe" -Recurse -ErrorAction SilentlyContinue) |
+                Select-Object -First 1
+        }
+        return $found
+    }
+
+    if (Test-Path $toolRoot) {
+        $existingExe = & $findExe $toolRoot $ExeFilter
         if ($existingExe) {
             Write-ColoredLine "[OK] $Name already cached, skipping download." Green
             return $existingExe
@@ -229,6 +263,14 @@ function Get-ForensicTool {
         Write-ColoredLine "Fetching $Name..." Cyan
         Save-RemoteFile -Uri $ZipUrl -Path $zipPath
         Add-Type -AssemblyName System.IO.Compression.FileSystem
+        if (Test-Path $toolRoot) {
+            # A prior attempt left a partial/mismatched extraction here (e.g.
+            # its exe wasn't found by the filter above, so we're retrying) --
+            # ExtractToDirectory throws "already exists" into a non-empty
+            # folder, so clear it first rather than fail every run after the
+            # first bad one.
+            Remove-Item -LiteralPath $toolRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
         [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $toolRoot)
         Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
         Write-ColoredLine "[OK] $Name ready." Green
@@ -237,10 +279,20 @@ function Get-ForensicTool {
         return $null
     }
 
-    $exe = & $filterExisting (Get-ChildItem -Path $toolRoot -Filter $ExeFilter -Recurse -ErrorAction SilentlyContinue) |
-        Select-Object -First 1
+    $exe = & $findExe $toolRoot $ExeFilter
+
     if (-not $exe) {
         Write-ColoredLine "[FAIL] $ExeFilter missing after extracting $Name." Red
+        # Show what actually came out of the zip instead of just "missing" --
+        # this is the difference between a one-line log entry a reviewer can
+        # act on (rename the filter, or the release changed layout) and a
+        # dead end.
+        $foundFiles = Get-ChildItem -Path $toolRoot -Recurse -ErrorAction SilentlyContinue | Select-Object -First 25 -ExpandProperty Name
+        if ($foundFiles) {
+            Write-ColoredLine ("       Extracted files instead: {0}" -f ($foundFiles -join ', ')) Yellow
+        } else {
+            Write-ColoredLine "       Extracted folder appears empty." Yellow
+        }
     }
     return $exe
 }
@@ -407,9 +459,57 @@ $ramColor = if ($ramOk) { "Green" } else { "Yellow" }
 Write-SpecLine "RAM: $totalRamGB GB across $($ramModules.Count) module(s), $ramSpeeds MHz" $ramColor
 Write-Host ""
 
+# Win32_VideoController.AdapterRAM is a 32-bit signed DWORD in WMI and
+# overflows above ~4GB, so it misreports VRAM on any card with more than
+# that (typically clamped to 4GB, sometimes 0 or garbage). Windows 10 1903+
+# drivers separately expose the real 64-bit value in the registry under the
+# Display class GUID as "HardwareInformation.qwMemorySize" -- read that
+# first and only fall back to the unreliable WMI field if it's missing.
+function Get-AccurateVramBytes {
+    param([Parameter(Mandatory = $true)]$Gpu)
+
+    $displayClassPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    try {
+        $subKeys = Get-ChildItem -Path $displayClassPath -ErrorAction Stop |
+            Where-Object { $_.PSChildName -match '^\d{4}$' }
+
+        foreach ($key in $subKeys) {
+            try {
+                $props = Get-ItemProperty -Path $key.PSPath -ErrorAction Stop
+
+                $isMatch = $false
+                if ($props.MatchingDeviceId -and $Gpu.PNPDeviceID -and
+                    $Gpu.PNPDeviceID -match [regex]::Escape($props.MatchingDeviceId)) {
+                    $isMatch = $true
+                }
+                if (-not $isMatch -and $props.DriverDesc -and $Gpu.Name -and $props.DriverDesc -eq $Gpu.Name) {
+                    $isMatch = $true
+                }
+
+                if ($isMatch -and $props.PSObject.Properties.Name -contains 'HardwareInformation.qwMemorySize') {
+                    $bytes = $props.'HardwareInformation.qwMemorySize'
+                    if ($bytes -and [uint64]$bytes -gt 0) { return [uint64]$bytes }
+                }
+            } catch {}
+        }
+    } catch {}
+    return $null
+}
+
 $gpuList = Get-CimInstance Win32_VideoController
+$gpuAccurateVram = @{ }
+foreach ($gpu in $gpuList) {
+    $gpuAccurateVram[$gpu.PNPDeviceID] = Get-AccurateVramBytes -Gpu $gpu
+}
+
 $activeGPU = $gpuList | Where-Object { $_.Name -match "NVIDIA|RTX|GTX|Radeon|RX " } | Select-Object -First 1
-if (-not $activeGPU) { $activeGPU = $gpuList | Sort-Object AdapterRAM -Descending | Select-Object -First 1 }
+if (-not $activeGPU) {
+    # Sort by the corrected VRAM figure when we have it, since AdapterRAM
+    # alone would misrank any >4GB card against a smaller one.
+    $activeGPU = $gpuList | Sort-Object -Descending -Property @{
+        Expression = { if ($gpuAccurateVram[$_.PNPDeviceID]) { $gpuAccurateVram[$_.PNPDeviceID] } else { $_.AdapterRAM } }
+    } | Select-Object -First 1
+}
 $activeGPUName = $activeGPU.Name
 $goodGPUs = @("RTX 30", "RTX 40", "RTX 50", "RX 6000", "RX 7000")
 $gpuIsGood = $false
@@ -418,7 +518,14 @@ $gpuColor = if ($gpuIsGood) { "Green" } else { "Yellow" }
 
 Write-SpecLine "GPU(s):"
 foreach ($gpu in $gpuList) {
-    $vram = if ($gpu.AdapterRAM -gt 0) { "$(ConvertTo-GB $gpu.AdapterRAM) GB" } else { "VRAM unknown" }
+    $accurateBytes = $gpuAccurateVram[$gpu.PNPDeviceID]
+    if ($accurateBytes) {
+        $vram = "$(ConvertTo-GB $accurateBytes) GB"
+    } elseif ($gpu.AdapterRAM -gt 0) {
+        $vram = "$(ConvertTo-GB $gpu.AdapterRAM) GB (approx -- WMI 32-bit field, may read low on >4GB cards)"
+    } else {
+        $vram = "VRAM unknown"
+    }
     Write-SpecLine "  - $($gpu.Name) [$vram, driver $($gpu.DriverVersion)]"
 }
 Write-SpecLine "Active: $activeGPUName" $gpuColor
@@ -1639,12 +1746,24 @@ $procExpExe = Get-ForensicTool -Name "ProcessExplorer" `
 # Config .reg is fetched externally -- pin the SHA-256 of the exact file you've
 # reviewed below before distributing this. Get it once via:
 #   (Get-FileHash "C:\ToolsACH\procexp_config.reg" -Algorithm SHA256).Hash
+#
+# NOTE: pastebin.com specifically gets DNS-blocked on a fair number of
+# school/dorm/office networks and by some AV or router-level filters (it's a
+# common malware-staging host, so it's an easy thing for a blocklist to flag),
+# which is why this can fail with "remote name could not be resolved" on a
+# machine where every other download in this script works fine. If you're
+# hosting your own copy, swapping this for a raw.githubusercontent.com URL
+# (like the other tool URLs in this script) is more likely to survive
+# whatever network the player happens to be on. Either way this step was
+# never fatal -- it only customizes Process Explorer's column layout, so a
+# failed fetch just means Process Explorer opens with default columns
+# instead of the tournament-preferred ones.
 $expectedProcExpRegHash = ""
 $regFileUrl = "https://pastebin.com/raw/gse8NxwU"
 $regFilePath = Join-Path $PersistentToolsRoot "procexp_config.reg"
 
 try {
-    Save-RemoteFile -Uri $regFileUrl -Path $regFilePath
+    Save-RemoteFile -Uri $regFileUrl -Path $regFilePath -TimeoutSec 8
     $actualRegHash = (Get-FileHash -LiteralPath $regFilePath -Algorithm SHA256).Hash
 
     if ($expectedProcExpRegHash -and $actualRegHash -ne $expectedProcExpRegHash) {
@@ -1735,11 +1854,25 @@ Add-Content -LiteralPath $monitorLogPath -Value "[chain:$Global:LogChainHash]"
 $Global:MonitorQuiet = $true
 
 # PESieve (memory-region/manual-map scanner) -- default to a known release URL
-$Global:PESIEVE_URL = "https://github.com/hasherezade/pe-sieve/releases/latest/download/pesieve_x64.zip"
+$Global:PESIEVE_URL = "https://github.com/hasherezade/pe-sieve/releases/latest/download/pe-sieve64.zip"
+# NOTE: was "pesieve_x64.zip" -- that filename has never existed as a
+# release asset for this project, so the download 404'd on every run
+# regardless of version. Real asset name (per the project's own Chocolatey
+# package and multiple independent references) is "pe-sieve64.zip".
 $Global:PESIEVE_EXPECTED_SHA256 = ""  # populate with pinned hash if you have one
 
 # Known drivers list URL (community-maintained). If unavailable, the driver heuristic will still run.
 $Global:KNOWN_DRIVERS_URL = "https://raw.githubusercontent.com/Neo23x0/LolDrivers/master/loldrivers.json"
+
+# Set-StrictMode -Version Latest (top of this script) makes reading an
+# *unset* global throw "variable has not been set" instead of quietly
+# returning $null. Test-KernelDrivers checks these two globals every scan to
+# decide whether it needs to fetch/re-fetch the known-driver list, so they
+# have to exist before the first call -- initializing them only inside the
+# function (via a bare assignment on first use) isn't enough under strict
+# mode, since the *read* on the line before that assignment is what throws.
+$Global:KnownDriversCache = $null
+$Global:KnownDriversCacheAttempted = $false
 
 # Password for the final evidence zip. NOTE: this is a plaintext secret sitting
 # in a script that (per the header) is distributed to players and posted on
@@ -2344,23 +2477,35 @@ function Test-KernelDrivers {
     $infoLines = New-Object System.Collections.ArrayList
     $knownDrivers = @{ }
 
-    # try fetching known-abusable drivers list (optional)
-    if ($KnownDriversUrl) {
-        try {
-            $json = Invoke-RestMethod -Uri $KnownDriversUrl -UseBasicParsing -ErrorAction Stop
-            if ($json -is [System.Collections.IDictionary]) {
-                foreach ($k in $json.Keys) { $knownDrivers[$k.ToLower()] = $json[$k] }
-            } elseif ($json -is [System.Array]) {
-                foreach ($entry in $json) {
-                    $nm = if ($entry -is [string]) { $entry } else { $entry.name -as [string] }
-                    if ($nm) { $knownDrivers[$nm.ToLower()] = $true }
+    # Fetched once per session and cached on $Global:KnownDriversCache --
+    # re-downloading the same list every 60s for the whole match was both
+    # wasteful and, on a slow/blocked network, a repeated chance to stall
+    # the monitoring loop. $Global:KnownDriversCacheAttempted remembers a
+    # failed fetch so we don't keep retrying (and re-risking a timeout)
+    # every single scan -- one skipped fetch just means this scan falls
+    # back to the local signature/temp-path/unsigned-driver heuristics below.
+    if ($null -eq $Global:KnownDriversCache -and -not $Global:KnownDriversCacheAttempted) {
+        $Global:KnownDriversCacheAttempted = $true
+        $Global:KnownDriversCache = @{ }
+        if ($KnownDriversUrl) {
+            try {
+                $json = Invoke-RestMethod -Uri $KnownDriversUrl -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+                if ($json -is [System.Collections.IDictionary]) {
+                    foreach ($k in $json.Keys) { $Global:KnownDriversCache[$k.ToLower()] = $json[$k] }
+                } elseif ($json -is [System.Array]) {
+                    foreach ($entry in $json) {
+                        $nm = if ($entry -is [string]) { $entry } else { $entry.name -as [string] }
+                        if ($nm) { $Global:KnownDriversCache[$nm.ToLower()] = $true }
+                    }
                 }
+            } catch {
+                # write fetch warning to the log but don't spam console
+                Write-MonitorLog ("WARNING: Couldn't fetch known-driver list: {0}" -f $_.Exception.Message) Yellow
             }
-        } catch {
-            # write fetch warning to the log but don't spam console
-            Write-MonitorLog ("WARNING: Couldn't fetch known-driver list: {0}" -f $_.Exception.Message) Yellow
         }
     }
+    $knownDrivers = $Global:KnownDriversCache
+    if ($null -eq $knownDrivers) { $knownDrivers = @{ } }
 
     try {
         $drivers = Get-CimInstance Win32_SystemDriver -ErrorAction Stop
@@ -2506,7 +2651,7 @@ function Test-PESieveForRoblox {
         return $results
     }
 
-    $pesieveExe = Get-ForensicTool -Name "PESieve" -ZipUrl $Global:PESIEVE_URL -ExeFilter "pesieve64.exe"
+    $pesieveExe = Get-ForensicTool -Name "PESieve" -ZipUrl $Global:PESIEVE_URL -ExeFilter "pe-sieve64.exe"
     if (-not $pesieveExe) {
         $results.Add("FAIL: pesieve not available")
         return $results
@@ -2698,6 +2843,214 @@ $Global:StopMonitoring = $false
 $Global:PackagingStarted = $false
 $Global:RobloxWasRunning = $false   # used to detect "Roblox started then stopped"
 
+# ---------------------------------------------------------------------------
+# RESTORED: packaging helper functions. These are called by PackageEvidence
+# below but were missing from the script -- Show-PackagingProgress (the
+# first thing PackageEvidence calls) was undefined, so PackageEvidence threw
+# immediately, got swallowed by its own try/catch, and packaging silently
+# produced nothing beyond the two logs written directly during monitoring.
+# ---------------------------------------------------------------------------
+
+$script:packagingTotalSteps = 10
+$script:packagingStep = 0
+
+function Show-PackagingProgress {
+    param([Parameter(Mandatory = $true)][string]$Stage)
+    $script:packagingStep++
+    $percent = [int](($script:packagingStep / $packagingTotalSteps) * 100)
+    $filled = [int](($script:packagingStep / $packagingTotalSteps) * 30)
+    $bar = ("#" * $filled).PadRight(30, "-")
+    Write-Host -NoNewline ("`r  [ {0} ] {1,3}%  {2}" -f $bar, $percent, $Stage.PadRight(32)) -ForegroundColor Cyan
+    if ($script:packagingStep -ge $packagingTotalSteps) { Write-Host "" }
+}
+
+function Save-Text {
+    param([Parameter(Mandatory = $true)][string]$Name, [AllowEmptyString()][string]$Data)
+    $Data | Out-File -LiteralPath (Join-Path $outputPath $Name) -Encoding utf8 -Force
+}
+
+function Save-Command {
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][scriptblock]$Command)
+    $filePath = Join-Path $outputPath $Name
+    try {
+        & $Command | Out-File -LiteralPath $filePath -Encoding utf8 -Width 4096 -Force
+    } catch {
+        @("command failed", "error: $($_.Exception.Message)") | Out-File -LiteralPath $filePath -Encoding utf8 -Force
+    }
+}
+
+function Get-Crc32 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return [AchCrc32]::Compute((Resolve-Path -LiteralPath $Path).Path)
+}
+
+function Get-RelativePath {
+    param([Parameter(Mandatory = $true)][string]$BasePath, [Parameter(Mandatory = $true)][string]$TargetPath)
+    $resolvedBase = [System.IO.Path]::GetFullPath($BasePath)
+    $resolvedTarget = [System.IO.Path]::GetFullPath($TargetPath)
+    $separator = [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedBase.EndsWith([string]$separator)) { $resolvedBase += $separator }
+    $baseUri = New-Object System.Uri($resolvedBase)
+    $targetUri = New-Object System.Uri($resolvedTarget)
+    $relativeUri = $baseUri.MakeRelativeUri($targetUri)
+    return [System.Uri]::UnescapeDataString($relativeUri.ToString()).Replace("/", "\")
+}
+
+function Get-FileIntegrity {
+    param([Parameter(Mandatory = $true)][string]$Path, [string]$RelativeTo)
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $file = Get-Item -LiteralPath $resolvedPath
+    $relativePath = if ($RelativeTo) { Get-RelativePath -BasePath $RelativeTo -TargetPath $resolvedPath } else { $file.Name }
+
+    return [pscustomobject]@{
+        Path = $relativePath
+        Size = $file.Length
+        CRC32 = Get-Crc32 -Path $resolvedPath
+        SHA256 = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
+        SHA512 = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA512).Hash
+    }
+}
+
+function New-IntegrityManifest {
+    param([Parameter(Mandatory = $true)][string]$DirectoryPath, [Parameter(Mandatory = $true)][string]$ManifestPath)
+
+    $files = @(Get-ChildItem -LiteralPath $DirectoryPath -File -Recurse | Where-Object { $_.FullName -ne $ManifestPath })
+    $output = New-Object System.Collections.Generic.List[string]
+
+    $output.Add("format version: 1")
+    $output.Add("created (UTC): $([DateTime]::UtcNow.ToString('O'))")
+    $output.Add("file count: $($files.Count)")
+    $output.Add("")
+
+    foreach ($file in $files) {
+        $hash = Get-FileIntegrity -Path $file.FullName -RelativeTo $DirectoryPath
+        $output.Add("path: $($hash.Path)")
+        $output.Add("size: $($hash.Size)")
+        $output.Add("crc32: $($hash.CRC32)")
+        $output.Add("sha256: $($hash.SHA256)")
+        $output.Add("sha512: $($hash.SHA512)")
+        $output.Add("")
+    }
+
+    $output | Out-File -LiteralPath $ManifestPath -Encoding utf8 -Force
+}
+
+function Collect-Prefetch {
+    $output = Join-Path $outputPath "prefetch_summary.txt"
+    $pecmd = Get-ForensicTool -Name "PECmd" -ZipUrl "https://download.ericzimmermanstools.com/PECmd.zip" -ExeFilter "PECmd.exe"
+    if (-not $pecmd) { "pecmd unavailable" | Out-File $output; return }
+
+    try {
+        $prefetchOutput = & $pecmd.FullName -d "C:\Windows\Prefetch"
+        $paths = New-Object System.Collections.Generic.List[string]
+        foreach ($line in $prefetchOutput) {
+            if ($line -match "^[A-Z]:\\") { $paths.Add($line.Trim()) }
+        }
+
+        if ($paths.Count -eq 0) {
+            "no prefetch paths found" | Out-File $output
+        } else {
+            $uniquePaths = $paths | Sort-Object -Unique
+            @("prefetch referenced paths", "", $uniquePaths) | Out-File -LiteralPath $output -Encoding utf8
+        }
+    } catch {
+        "prefetch parsing failed: $($_.Exception.Message)" | Out-File $output
+    }
+}
+
+function Collect-BAM {
+    $output = Join-Path $outputPath "bam_summary.txt"
+    $bamPaths = @(
+        "HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings"
+        "HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings"
+    )
+    $results = New-Object System.Collections.Generic.List[string]
+
+    foreach ($path in $bamPaths) {
+        if (-not (Test-Path $path)) { continue }
+        $results.Add("registry path: $path")
+        try {
+            Get-ChildItem -Path $path -Recurse -ErrorAction Stop | ForEach-Object {
+                $results.Add("path: $($_.Name)")
+                try {
+                    $properties = Get-ItemProperty $_.PsPath
+                    foreach ($property in $properties.PSObject.Properties) {
+                        if ($property.Name -notmatch "^PS") { $results.Add("$($property.Name): $($property.Value)") }
+                    }
+                } catch {}
+            }
+        } catch {
+            $results.Add("bam collection failed: $($_.Exception.Message)")
+        }
+    }
+
+    if ($results.Count -eq 0) { $results.Add("bam unavailable") }
+    $results | Out-File -LiteralPath $output -Encoding utf8
+}
+
+function Collect-Amcache {
+    $output = Join-Path $outputPath "amcache_summary.txt"
+    $amcachePath = "C:\Windows\AppCompat\Programs\Amcache.hve"
+    if (-not (Test-Path $amcachePath)) { "amcache unavailable" | Out-File $output; return }
+
+    $parser = Get-ForensicTool -Name "AmcacheParser" -ZipUrl "https://download.ericzimmermanstools.com/AmcacheParser.zip" -ExeFilter "AmcacheParser.exe"
+    if (-not $parser) { "amcacheparser unavailable" | Out-File $output; return }
+
+    try {
+        $amcacheScratch = Join-Path $PersistentToolsRoot "AmcacheParser\_scratch"
+        New-Item -ItemType Directory -Path $amcacheScratch -Force -ErrorAction SilentlyContinue | Out-Null
+
+        & $parser.FullName -f $amcachePath --csv $amcacheScratch | Out-Null
+
+        $csv = Get-ChildItem -Path $amcacheScratch -Filter "*.csv" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+
+        if ($csv) {
+            Get-Content $csv.FullName | Out-File -LiteralPath $output -Encoding utf8
+        } else {
+            "no amcache output returned" | Out-File $output
+        }
+    } catch {
+        "amcache parsing failed: $($_.Exception.Message)" | Out-File $output
+    }
+}
+
+function Test-LogChainIntegrity {
+    param([string]$LogPath)
+    if (-not (Test-Path $LogPath)) { return "SKIPPED: log file not found" }
+
+    $lines = Get-Content -LiteralPath $LogPath
+    $running = "GENESIS"
+    $lineNumber = 0
+    for ($i = 0; $i -lt $lines.Count; $i += 2) {
+        $lineNumber++
+        $content_line = $lines[$i]
+        $chainLine = if ($i + 1 -lt $lines.Count) { $lines[$i + 1] } else { $null }
+
+        $expected = Get-ChainHash -PreviousHash $running -Line $content_line
+        $expectedTag = "[chain:$expected]"
+
+        if ($chainLine -ne $expectedTag) {
+            return "FAILURE: chain broken at entry $lineNumber -- log may have been edited or reordered after the fact"
+        }
+        $running = $expected
+    }
+    return "SUCCESS: all $lineNumber log entries verified, chain intact"
+}
+
+function Find-SevenZip {
+    $candidates = @(
+        "$env:ProgramFiles\7-Zip\7z.exe",
+        "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) { return $candidate }
+    }
+    $onPath = Get-Command "7z.exe" -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+    return $null
+}
+
 function Reset-Proxy {
     try {
         Write-MonitorLog "Resetting WinHTTP proxy (cleanup)..." Cyan -NoConsole
@@ -2813,13 +3166,35 @@ function PackageEvidence {
         # Clean up working folder but keep the final zip
         Remove-Item -LiteralPath $outputPath -Recurse -Force -ErrorAction SilentlyContinue
 
-        Write-MonitorLog ("Packaging complete. Archive: {0} SHA256: {1}" -f $zipPath, $zipSha256) Cyan
+        Write-MonitorLog ("Packaging complete. Archive: {0} SHA256: {1} Password-protected: {2}" -f $zipPath, $zipSha256, $zipIsPasswordProtected) Cyan -NoConsole
+
+        # Always-visible summary -- not routed through the quiet logger,
+        # since there's nothing left to hide once the match is over, and
+        # silently swallowing the password-protection result is exactly
+        # what made the "isn't password encrypted" bug invisible before.
+        Write-Host ""
+        Write-Host "============================================================" -ForegroundColor Green
+        Write-Host "  Recording package ready" -ForegroundColor Green
+        Write-Host "============================================================" -ForegroundColor Green
+        Write-Host "  Folder   : $outputRoot" -ForegroundColor White
+        Write-Host "  File     : $zipPath" -ForegroundColor White
+        Write-Host "  SHA256   : $zipSha256" -ForegroundColor White
+        if ($zipIsPasswordProtected) {
+            Write-Host "  Password : Protected (AES-256 via 7-Zip)" -ForegroundColor White
+        } else {
+            Write-Host "  Password : NOT protected -- 7-Zip wasn't found at C:\Program Files\7-Zip\7z.exe (or on PATH), so this zip is a plain unencrypted archive. Install 7-Zip on this machine if password protection is required." -ForegroundColor Yellow
+        }
+        Write-Host "  Log chain: $logChainResult" -ForegroundColor White
+        Write-Host "============================================================" -ForegroundColor Green
 
         # Reset proxy as part of cleanup
         Reset-Proxy
 
     } catch {
         Write-MonitorLog ("ERROR during packaging: {0}" -f $_.Exception.Message) Red
+        Write-Host ""
+        Write-Host "[PACKAGING FAILED] $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Evidence folder was left in place instead of being deleted, so you don't lose what was collected: $outputPath" -ForegroundColor Yellow
         # Attempt to reset proxy even on failure
         Reset-Proxy
     }
@@ -2946,40 +3321,19 @@ if ($Global:AchProcessWatcherActive) {
 Write-Host ""
 Write-ColoredLine "Match monitoring stopped." Green
 Write-Host ""
-
-# Ensure proxy reset / packaging always run once when we exit the loop
-PackageEvidence
-
-Write-Host "============================================================" -ForegroundColor Magenta
-Write-Host "  Resetting WinHTTP proxy (post-match)" -ForegroundColor Magenta
-Write-Host "============================================================" -ForegroundColor Magenta
-try {
-    $resetOut = & "$env:SystemRoot\System32\netsh.exe" winhttp reset proxy 2>&1
-    foreach ($line in @($resetOut)) { Write-Host "   $line" -ForegroundColor White }
-    Write-Host "  proxy reset" -ForegroundColor Green
-    $show = & "$env:SystemRoot\System32\netsh.exe" winhttp show proxy 2>&1
-    foreach ($line in @($show)) { Write-Host "   $line" -ForegroundColor White }
-} catch {
-    Write-Host "  failed to reset proxy: $($_.Exception.Message)" -ForegroundColor Red
-}
-Write-Host "============================================================" -ForegroundColor Magenta
-Write-Host ""
-Start-Sleep -Seconds 2
-
-# ---------------------------------------------------------------------------
-# Evidence collection + packaging (final messaging handled inside PackageEvidence)
-# ---------------------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Match complete." -ForegroundColor Green
 Write-Host "Packaging forensic evidence -- this takes a minute, please don't close the window." -ForegroundColor Cyan
 Write-Host ""
 
-# The remainder of the packaging helpers (Show-PackagingProgress, Save-Text, Save-Command,
-# Get-Crc32, Get-RelativePath, Get-FileIntegrity, New-IntegrityManifest, Collect-Prefetch, Collect-BAM,
-# Collect-Amcache, Test-LogChainIntegrity, Find-SevenZip, etc.) are already defined above or used by PackageEvidence.
-# PackageEvidence already performed the work at the point where we exited monitoring.
-# If needed, message and final info already printed by PackageEvidence.
+# PackageEvidence (defined earlier in this file) does the actual work: it
+# writes out every log, builds the integrity manifest, creates the
+# password-protected zip via 7-Zip when available, resets the WinHTTP proxy,
+# and prints its own "Recording package ready" summary -- including an
+# explicit warning if the zip ended up unprotected. Everything here used to
+# be duplicated below (a second proxy reset, an out-of-order "Match
+# complete" message printed after packaging had already finished) -- that
+# duplication is removed; PackageEvidence is the single source of truth for
+# what happens once monitoring stops.
+PackageEvidence
 
 if ($rebootRequired) {
     Write-Host ""
